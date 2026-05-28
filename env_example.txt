@@ -1,0 +1,28 @@
+# ─────────────────────────────────────────
+#  CRYPTO SIGNAL BOT — Переменные окружения
+#  Скопируй этот файл в .env и заполни
+# ─────────────────────────────────────────
+
+# ── ОБЯЗАТЕЛЬНЫЕ ──────────────────────────
+
+# Telegram: получи у @BotFather в Telegram
+TELEGRAM_BOT_TOKEN=1234567890:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# Telegram: твой Chat ID (получи у @userinfobot)
+TELEGRAM_CHAT_ID=123456789
+
+# Claude API: https://console.anthropic.com
+CLAUDE_API_KEY=sk-ant-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# ── ОПЦИОНАЛЬНЫЕ (бот работает и без них) ─
+
+# CryptoPanic: бесплатная регистрация на cryptopanic.com → API
+CRYPTOPANIC_TOKEN=
+
+# Coinglass: бесплатная регистрация на coinglass.com → API
+COINGLASS_API_KEY=
+
+# ── НАСТРОЙКИ ─────────────────────────────
+
+# Как часто запускать анализ (в часах)
+ANALYSIS_INTERVAL_HOURS=6
