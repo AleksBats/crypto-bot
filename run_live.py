@@ -8,9 +8,18 @@ Signals monitored:
   - Volume spike (1h volume vs average)
   - Open Interest change
   - Funding rate extremes
-  - Breakout          (daily Donchian channel break)          ← NEW
-  - Turtle Zone Filter (dual-channel Turtle-style system)      ← NEW
-  - Failure Test       (false-breakout / trap detector)        ← NEW
+  - Breakout          (daily Donchian channel break)
+  - Turtle Zone Filter (dual-channel Turtle-style system)
+  - Failure Test       (false-breakout / trap detector)
+
+Every Breakout / Turtle Zone / Failure Test alert that is ACTUALLY sent to
+Telegram (i.e. survives alert_engine's cooldown) is also recorded in the
+signal_stats/ package for objective WIN/LOSS/OPEN paper-trading tracking —
+see signal_stats/signal_tracker.py and DECISIONS.md #12 for the methodology.
+A separate background task listens for /stats /week /today /month commands
+(signal_stats/telegram_commands.py). None of this changes indicator logic,
+thresholds, symbol lists, or existing alert behavior — it only observes
+what already happens and records it.
 
 Run:
     python run_live.py
@@ -52,6 +61,8 @@ from alert_engine import Signal, engine
 from state import state
 import telegram_bot as tg
 import technical_signals as ts
+from signal_stats import signal_tracker as stats_tracker
+from signal_stats.telegram_commands import run_command_listener
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 LOG_DIR = Path(__file__).parent / "logs"
@@ -236,6 +247,49 @@ async def fetch_daily(client: httpx.AsyncClient, symbol: str) -> dict:
 
 
 # ════════════════════════════════════════════════
+# STATISTICS RECORDING HELPER (shared by evaluate_signals + scan_technical_symbols)
+# ════════════════════════════════════════════════
+
+async def _record_technical_stats(
+    symbol: str, highs: list[float], lows: list[float], closes: list[float],
+    bo: Optional[dict], sent_breakout: bool,
+    tzone: Optional[dict], sent_turtle: bool,
+):
+    """Records Breakout/Turtle Zone signals into signal_stats/, merging same-day
+    same-direction Breakout+Turtle into one combo row instead of two rows —
+    see signal_stats/signal_tracker.decide_breakout_turtle_setup and
+    DECISIONS.md #12. Never raises — a statistics failure must never affect
+    alerting, so every call site wraps this in its own try/except too."""
+    bo_direction = ("LONG" if bo["direction"] == "bullish" else "SHORT") if bo else None
+    tzone_direction = ("LONG" if tzone["direction"] == "bullish" else "SHORT") if tzone else None
+
+    combo_setup = None
+    if bo_direction is not None and bo_direction == tzone_direction:
+        combo_setup = stats_tracker.decide_breakout_turtle_setup(sent_breakout, sent_turtle)
+
+    if combo_setup:
+        await stats_tracker.record_signal(
+            symbol=symbol, direction=tzone_direction, setup=combo_setup,
+            entry_price=tzone["price"], entry_level=tzone["fast_level"],
+            fast_n=config.TURTLE_FAST_LOOKBACK, highs=highs, lows=lows, closes=closes,
+        )
+        return
+
+    if sent_breakout:
+        await stats_tracker.record_signal(
+            symbol=symbol, direction=bo_direction, setup="breakout",
+            entry_price=bo["price"], entry_level=bo["level"],
+            fast_n=config.DONCHIAN_LOOKBACK, highs=highs, lows=lows, closes=closes,
+        )
+    if sent_turtle:
+        await stats_tracker.record_signal(
+            symbol=symbol, direction=tzone_direction, setup="turtle_zone",
+            entry_price=tzone["price"], entry_level=tzone["fast_level"],
+            fast_n=config.TURTLE_FAST_LOOKBACK, highs=highs, lows=lows, closes=closes,
+        )
+
+
+# ════════════════════════════════════════════════
 # SIGNAL EVALUATION
 # ════════════════════════════════════════════════
 
@@ -307,11 +361,20 @@ async def evaluate_signals(spot: dict, futures: Optional[dict], daily: Optional[
         highs, lows, closes = daily["highs"], daily["lows"], daily["closes"]
         symbol = config.SYMBOL_SPOT
 
+        # Re-check previously recorded OPEN signals against the latest daily
+        # candles before looking for new ones (statistics layer only — does
+        # not affect alerting). See signal_stats/signal_tracker.py.
+        try:
+            await stats_tracker.resolve_open_signals(symbol, highs, lows, closes)
+        except Exception as e:
+            logger.error("statistics: resolve_open_signals failed for %s: %s", symbol, e)
+
         # Breakout
         bo = ts.detect_breakout(highs, lows, closes, n=config.DONCHIAN_LOOKBACK)
+        sent_breakout = False
         if bo:
             key = f"breakout_{'bull' if bo['direction'] == 'bullish' else 'bear'}_{symbol}"
-            await engine.submit(Signal(
+            sent_breakout = await engine.submit(Signal(
                 key=key,
                 strong=True,
                 message=tg.fmt_breakout_alert(symbol, bo["direction"], bo["level"], bo["price"], bo["n"]),
@@ -323,10 +386,11 @@ async def evaluate_signals(spot: dict, futures: Optional[dict], daily: Optional[
             highs, lows, closes,
             fast=config.TURTLE_FAST_LOOKBACK, slow=config.TURTLE_SLOW_LOOKBACK,
         )
+        sent_turtle = False
         if tzone:
             key = f"turtle_zone_{'bull' if tzone['direction'] == 'bullish' else 'bear'}_{symbol}"
             strong = tzone["stage"] == "confirmed"
-            await engine.submit(Signal(
+            sent_turtle = await engine.submit(Signal(
                 key=key,
                 strong=strong,
                 message=tg.fmt_turtle_zone_alert(
@@ -336,6 +400,11 @@ async def evaluate_signals(spot: dict, futures: Optional[dict], daily: Optional[
                 priority=2,
             ))
 
+        try:
+            await _record_technical_stats(symbol, highs, lows, closes, bo, sent_breakout, tzone, sent_turtle)
+        except Exception as e:
+            logger.error("statistics: record_signal failed for %s: %s", symbol, e)
+
         # Failure Test
         ft = ts.detect_failure_test(
             highs, lows, closes,
@@ -343,16 +412,25 @@ async def evaluate_signals(spot: dict, futures: Optional[dict], daily: Optional[
         )
         if ft:
             key = f"failure_test_{ft['direction'].lower()}_{symbol}"
-            await engine.submit(Signal(
+            sent_ft = await engine.submit(Signal(
                 key=key,
                 strong=True,
                 message=tg.fmt_failure_test_alert(symbol, ft["direction"], ft["level"], ft["price"]),
                 priority=2,
             ))
+            if sent_ft:
+                try:
+                    await stats_tracker.record_signal(
+                        symbol=symbol, direction=ft["direction"], setup="failure_test",
+                        entry_price=ft["price"], entry_level=ft["level"],
+                        fast_n=config.DONCHIAN_LOOKBACK, highs=highs, lows=lows, closes=closes,
+                    )
+                except Exception as e:
+                    logger.error("statistics: record_signal failed (failure_test) for %s: %s", symbol, e)
 
 
 # ════════════════════════════════════════════════
-# MULTI-SYMBOL TECHNICAL SCAN (Breakout / Turtle Zone / Failure Test only)
+# MULTI-SYMBOL TECHNICAL SCAN (Breakout/Turtle Zone/Failure Test only)
 # ════════════════════════════════════════════════
 
 async def scan_technical_symbols(client: httpx.AsyncClient):
@@ -369,10 +447,16 @@ async def scan_technical_symbols(client: httpx.AsyncClient):
 
         highs, lows, closes = daily["highs"], daily["lows"], daily["closes"]
 
+        try:
+            await stats_tracker.resolve_open_signals(symbol, highs, lows, closes)
+        except Exception as e:
+            logger.error("statistics: resolve_open_signals failed for %s: %s", symbol, e)
+
         bo = ts.detect_breakout(highs, lows, closes, n=config.DONCHIAN_LOOKBACK)
+        sent_breakout = False
         if bo:
             key = f"breakout_{'bull' if bo['direction'] == 'bullish' else 'bear'}_{symbol}"
-            await engine.submit(Signal(
+            sent_breakout = await engine.submit(Signal(
                 key=key,
                 strong=True,
                 message=tg.fmt_breakout_alert(symbol, bo["direction"], bo["level"], bo["price"], bo["n"]),
@@ -383,10 +467,11 @@ async def scan_technical_symbols(client: httpx.AsyncClient):
             highs, lows, closes,
             fast=config.TURTLE_FAST_LOOKBACK, slow=config.TURTLE_SLOW_LOOKBACK,
         )
+        sent_turtle = False
         if tzone:
             key = f"turtle_zone_{'bull' if tzone['direction'] == 'bullish' else 'bear'}_{symbol}"
             strong = tzone["stage"] == "confirmed"
-            await engine.submit(Signal(
+            sent_turtle = await engine.submit(Signal(
                 key=key,
                 strong=strong,
                 message=tg.fmt_turtle_zone_alert(
@@ -396,18 +481,32 @@ async def scan_technical_symbols(client: httpx.AsyncClient):
                 priority=2,
             ))
 
+        try:
+            await _record_technical_stats(symbol, highs, lows, closes, bo, sent_breakout, tzone, sent_turtle)
+        except Exception as e:
+            logger.error("statistics: record_signal failed for %s: %s", symbol, e)
+
         ft = ts.detect_failure_test(
             highs, lows, closes,
             n=config.DONCHIAN_LOOKBACK, lookback=config.FAILURE_TEST_LOOKBACK,
         )
         if ft:
             key = f"failure_test_{ft['direction'].lower()}_{symbol}"
-            await engine.submit(Signal(
+            sent_ft = await engine.submit(Signal(
                 key=key,
                 strong=True,
                 message=tg.fmt_failure_test_alert(symbol, ft["direction"], ft["level"], ft["price"]),
                 priority=2,
             ))
+            if sent_ft:
+                try:
+                    await stats_tracker.record_signal(
+                        symbol=symbol, direction=ft["direction"], setup="failure_test",
+                        entry_price=ft["price"], entry_level=ft["level"],
+                        fast_n=config.DONCHIAN_LOOKBACK, highs=highs, lows=lows, closes=closes,
+                    )
+                except Exception as e:
+                    logger.error("statistics: record_signal failed (failure_test) for %s: %s", symbol, e)
 
 
 # ════════════════════════════════════════════════
@@ -428,6 +527,7 @@ async def run_loop():
     logger.info("  Technical-only symbols: %s", ", ".join(config.TECHNICAL_SYMBOLS))
     logger.info("  Interval: %ds", POLL_INTERVAL_SECS)
     logger.info("  Cooldown: %ds per signal type", config.ALERT_COOLDOWN_SECS)
+    logger.info("  Statistics DB: %s", "configured" if config.DATABASE_URL else "NOT configured (statistics disabled)")
     logger.info("  Log file: logs/aster_bot.log")
     logger.info("=" * 60)
 
@@ -529,6 +629,12 @@ async def main():
     # Health-check сервер для Render Web Service (бесплатный тариф) — не мешает
     # основному циклу, просто отвечает "alive" на HTTP-пинги платформы.
     _start_health_server()
+
+    # Telegram command listener (/stats /week /today /month) — independent
+    # background task. Fully additive: if it crashes, alerting is unaffected
+    # (asyncio.create_task fire-and-forget; errors are logged inside the
+    # task itself, see signal_stats/telegram_commands.py).
+    asyncio.create_task(run_command_listener())
 
     # Handle Ctrl+C and kill signals gracefully
     for sig in (signal.SIGINT, signal.SIGTERM):

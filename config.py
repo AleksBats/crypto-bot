@@ -84,3 +84,35 @@ TWITTER_WATCH_ACCOUNTS = [
 
 # ── Alert cooldown — don't re-alert same signal within N seconds ─────────────
 ALERT_COOLDOWN_SECS = int(os.environ.get("ALERT_COOLDOWN_SECS", "1800"))  # 30 min
+
+# ── Signal performance statistics / paper trading (Phase 2) ──────────────────
+# Superseded design: the standalone top-level signal_tracker.py + JSON-file
+# approach from the first stats prototype is replaced by the statistics/
+# package (Postgres-backed). See DECISIONS.md #12.
+#
+# DATABASE_URL is intentionally OPTIONAL here, not _require()'d — the whole
+# bot must keep working (alerts, indicators, everything) even if nobody has
+# provisioned a database yet. If empty, run_live.py skips initializing the
+# statistics subsystem entirely (logs one warning at startup) instead of
+# crashing. Never make the core trading loop depend on this being set.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")  # Neon Postgres connection string (postgres://...)
+
+# Standard Wilder RSI period — 14 is the universal default, not a value we
+# invented for this project. Recorded per-signal for context only; it does
+# NOT feed into signal generation or the WIN/LOSS rule.
+RSI_PERIOD = int(os.environ.get("RSI_PERIOD", "14"))
+
+# Long-poll timeout (seconds) for the Telegram command listener's getUpdates
+# calls — standard long-polling pattern, not a busy-loop interval. Higher =
+# fewer HTTP requests, still near-instant command responses. Irrelevant to
+# alert sending.
+TELEGRAM_POLL_INTERVAL_SECS = int(os.environ.get("TELEGRAM_POLL_INTERVAL_SECS", "25"))
+
+# Only this chat may trigger /stats /week /today /month. Defaults to the
+# same chat the bot already alerts into.
+STATS_ALLOWED_CHAT_ID = os.environ.get("STATS_ALLOWED_CHAT_ID", TELEGRAM_CHAT_ID)
+
+# Minimum number of closed signals a symbol/setup needs before it's eligible
+# for "best/worst" ranking in reports — avoids a single lucky/unlucky trade
+# looking like a trend. Display threshold only, not a trading threshold.
+MIN_SAMPLE_FOR_RANKING = int(os.environ.get("MIN_SAMPLE_FOR_RANKING", "3"))

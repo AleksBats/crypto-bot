@@ -40,12 +40,21 @@ class AlertEngine:
     def _mark_sent(self, key: str):
         state.alert_cooldowns[key] = time.time()
 
-    async def submit(self, signal: Signal):
-        """Submit a signal for evaluation. Thread-safe via asyncio lock."""
+    async def submit(self, signal: Signal) -> bool:
+        """Submit a signal for evaluation. Thread-safe via asyncio lock.
+
+        Returns True if this signal's message was actually sent to Telegram
+        just now (standalone strong alert, or part of a weak combo that just
+        fired) — False if it was suppressed by cooldown or is still waiting
+        to combo with another weak signal. Added purely so callers (see
+        statistics/signal_tracker.py) can record paper-trading signals only
+        for what a subscriber actually saw — this does NOT change any
+        cooldown/combo decision below, only exposes the existing outcome.
+        """
         async with self._lock:
             if self._is_on_cooldown(signal.key):
                 logger.debug("Signal %s is on cooldown, skipping.", signal.key)
-                return
+                return False
 
             if signal.strong:
                 await tg.send_alert(signal.message)
@@ -55,6 +64,7 @@ class AlertEngine:
                     combo_names = [s.key for s in self._pending_weak]
                     logger.info("Flushing %d pending weak signals with strong alert.", len(combo_names))
                     self._pending_weak.clear()
+                return True
             else:
                 # Accumulate weak signals; fire combo if ≥ 2 unique keys
                 existing_keys = {s.key for s in self._pending_weak}
@@ -63,6 +73,8 @@ class AlertEngine:
 
                 if len(self._pending_weak) >= 2:
                     await self._send_combo()
+                    return True
+                return False
 
     async def _send_combo(self):
         names = [s.key.replace("_", " ").title() for s in self._pending_weak]
