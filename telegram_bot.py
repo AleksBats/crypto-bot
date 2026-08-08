@@ -97,3 +97,40 @@ def fmt_twitter_alert(handle: str, text: str, url: str) -> str:
 def fmt_combo_alert(signals: list[str]) -> str:
     joined = "\n".join(f"  • {s}" for s in signals)
     return f"⚡️ <b>MULTIPLE SIGNALS</b>\n\n{joined}"
+
+
+# ─────────────────────────────────────────────────────────────
+#  Новые форматтеры для Breakout / Turtle Zone Filter / Failure Test
+# ─────────────────────────────────────────────────────────────
+def fmt_breakout_alert(direction: str, level: float, price: float, n: int) -> str:
+    emoji = "🚀" if direction == "bullish" else "🔻"
+    label = "BREAKOUT LONG" if direction == "bullish" else "BREAKOUT SHORT"
+    return (
+        f"{emoji} <b>{label}</b>\n"
+        f"Канал: {n}-дневной Donchian\n"
+        f"Уровень пробоя: ${level:.6f}\n"
+        f"Цена: <b>${price:.6f}</b>"
+    )
+
+
+def fmt_turtle_zone_alert(direction: str, stage: str, fast_level: float, slow_level: float, price: float) -> str:
+    emoji = "🐢🚀" if direction == "bullish" else "🐢🔻"
+    label = "TURTLE ZONE LONG" if direction == "bullish" else "TURTLE ZONE SHORT"
+    stage_ru = "подтверждено (пробит и 55-дневный канал)" if stage == "confirmed" else "ранняя зона (пробит только 20-дневный канал)"
+    return (
+        f"{emoji} <b>{label}</b>\n"
+        f"Стадия: {stage_ru}\n"
+        f"Fast (20d): ${fast_level:.6f}\n"
+        f"Slow (55d): ${slow_level:.6f}\n"
+        f"Цена: <b>${price:.6f}</b>"
+    )
+
+
+def fmt_failure_test_alert(direction: str, level: float, price: float) -> str:
+    emoji = "⚠️🔻" if direction == "SHORT" else "⚠️🚀"
+    return (
+        f"{emoji} <b>FAILURE TEST {direction}</b>\n"
+        f"Ложный пробой уровня ${level:.6f}\n"
+        f"Текущая цена: <b>${price:.6f}</b>\n"
+        f"<i>Цена не удержала пробой — вероятность разворота</i>"
+    )

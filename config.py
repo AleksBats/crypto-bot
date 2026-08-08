@@ -46,6 +46,14 @@ OI_CHANGE_PCT_THRESHOLD = float(os.environ.get("OI_CHANGE_PCT_THRESHOLD", "10.0"
 FUNDING_EXTREME_PCT     = float(os.environ.get("FUNDING_EXTREME_PCT",     "0.05"))    # 0.05% per 8h
 PRICE_BREAKOUT_PCT      = float(os.environ.get("PRICE_BREAKOUT_PCT",      "3.0"))     # 3% move
 
+# ── Технические сигналы (Donchian / Turtle-style) ─────────────────────────────
+DONCHIAN_LOOKBACK     = int(os.environ.get("DONCHIAN_LOOKBACK",     "20"))  # период канала для Breakout
+TURTLE_FAST_LOOKBACK  = int(os.environ.get("TURTLE_FAST_LOOKBACK",  "20"))  # Turtle System 1
+TURTLE_SLOW_LOOKBACK  = int(os.environ.get("TURTLE_SLOW_LOOKBACK",  "55"))  # Turtle System 2
+FAILURE_TEST_LOOKBACK = int(os.environ.get("FAILURE_TEST_LOOKBACK", "5"))   # баров назад для проверки ложного пробоя
+DAILY_KLINES_LIMIT    = int(os.environ.get("DAILY_KLINES_LIMIT",    "90"))  # дневных свечей на загрузку
+POLL_TECHNICAL_SECS   = int(os.environ.get("POLL_TECHNICAL_SECS",   "900")) # 15 мин — дневные данные не нужно чаще
+
 # ── Polling intervals (seconds) ──────────────────────────────────────────────
 POLL_PRICE_SECS    = int(os.environ.get("POLL_PRICE_SECS",   "60"))
 POLL_OI_SECS       = int(os.environ.get("POLL_OI_SECS",      "60"))

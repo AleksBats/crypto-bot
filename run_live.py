@@ -4,6 +4,14 @@ run_live.py — Continuous 24/7 local monitoring loop for Aster Intelligence Bot
 Uses only free Binance public API. No Twitter. No whale monitor.
 Sends Telegram alerts only when alert_engine detects important signals.
 
+Signals monitored:
+  - Volume spike (1h volume vs average)
+  - Open Interest change
+  - Funding rate extremes
+  - Breakout          (daily Donchian channel break)          ← NEW
+  - Turtle Zone Filter (dual-channel Turtle-style system)      ← NEW
+  - Failure Test       (false-breakout / trap detector)        ← NEW
+
 Run:
     python run_live.py
 
@@ -14,6 +22,7 @@ Logs:
     Console + logs/aster_bot.log
 
 Check interval: 5 minutes (POLL_INTERVAL_SECS)
+Technical (daily) signals refresh: 15 minutes (config.POLL_TECHNICAL_SECS)
 Alert cooldown: 30 minutes per signal type (from config.py)
 """
 
@@ -40,6 +49,7 @@ import config
 from alert_engine import Signal, engine
 from state import state
 import telegram_bot as tg
+import technical_signals as ts
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 LOG_DIR = Path(__file__).parent / "logs"
@@ -75,6 +85,10 @@ FUT_FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
 
 _futures_available = None   # None = unknown, True = available, False = skip
 _shutdown = False
+
+# ── Daily-candle cache for technical signals (refreshed every POLL_TECHNICAL_SECS) ──
+_daily_cache: Optional[dict] = None
+_daily_cache_ts: float = 0.0
 
 
 # ════════════════════════════════════════════════
@@ -167,11 +181,36 @@ async def fetch_futures(client: httpx.AsyncClient) -> Optional[dict]:
     return result
 
 
+async def fetch_daily(client: httpx.AsyncClient) -> dict:
+    """Fetch daily candles for Donchian-based technical signals (Breakout,
+    Turtle Zone Filter, Failure Test). Cached for POLL_TECHNICAL_SECS since
+    daily data doesn't change meaningfully every 5 minutes."""
+    global _daily_cache, _daily_cache_ts
+
+    now = time.monotonic()
+    if _daily_cache is not None and (now - _daily_cache_ts) < config.POLL_TECHNICAL_SECS:
+        return _daily_cache
+
+    r = await client.get(SPOT_KLINES_URL, params={
+        "symbol": config.SYMBOL_SPOT, "interval": "1d", "limit": config.DAILY_KLINES_LIMIT
+    })
+    r.raise_for_status()
+    rows = r.json()
+    result = {
+        "highs":  [float(c[2]) for c in rows],
+        "lows":   [float(c[3]) for c in rows],
+        "closes": [float(c[4]) for c in rows],
+    }
+    _daily_cache = result
+    _daily_cache_ts = now
+    return result
+
+
 # ════════════════════════════════════════════════
 # SIGNAL EVALUATION
 # ════════════════════════════════════════════════
 
-async def evaluate_signals(spot: dict, futures: Optional[dict]):
+async def evaluate_signals(spot: dict, futures: Optional[dict], daily: Optional[dict]):
     """Check all thresholds and submit signals to alert_engine."""
     price = spot["price"]
 
@@ -234,6 +273,53 @@ async def evaluate_signals(spot: dict, futures: Optional[dict]):
                 message=tg.fmt_funding_alert(funding, funding_prev),
             ))
 
+    # ── Технические сигналы (daily) ───────────────────────────────────────────
+    if daily:
+        highs, lows, closes = daily["highs"], daily["lows"], daily["closes"]
+
+        # Breakout
+        bo = ts.detect_breakout(highs, lows, closes, n=config.DONCHIAN_LOOKBACK)
+        if bo:
+            key = f"breakout_{'bull' if bo['direction'] == 'bullish' else 'bear'}"
+            await engine.submit(Signal(
+                key=key,
+                strong=True,
+                message=tg.fmt_breakout_alert(bo["direction"], bo["level"], bo["price"], bo["n"]),
+                priority=2,
+            ))
+
+        # Turtle Zone Filter
+        tzone = ts.detect_turtle_zone(
+            highs, lows, closes,
+            fast=config.TURTLE_FAST_LOOKBACK, slow=config.TURTLE_SLOW_LOOKBACK,
+        )
+        if tzone:
+            key = f"turtle_zone_{'bull' if tzone['direction'] == 'bullish' else 'bear'}"
+            strong = tzone["stage"] == "confirmed"
+            await engine.submit(Signal(
+                key=key,
+                strong=strong,
+                message=tg.fmt_turtle_zone_alert(
+                    tzone["direction"], tzone["stage"],
+                    tzone["fast_level"], tzone["slow_level"], tzone["price"],
+                ),
+                priority=2,
+            ))
+
+        # Failure Test
+        ft = ts.detect_failure_test(
+            highs, lows, closes,
+            n=config.DONCHIAN_LOOKBACK, lookback=config.FAILURE_TEST_LOOKBACK,
+        )
+        if ft:
+            key = f"failure_test_{ft['direction'].lower()}"
+            await engine.submit(Signal(
+                key=key,
+                strong=True,
+                message=tg.fmt_failure_test_alert(ft["direction"], ft["level"], ft["price"]),
+                priority=2,
+            ))
+
 
 # ════════════════════════════════════════════════
 # MAIN LOOP
@@ -259,6 +345,7 @@ async def run_loop():
         "🟢 <b>Aster Bot — Live Mode Started</b>\n\n"
         f"Symbol: <code>{config.SYMBOL_SPOT}</code>\n"
         f"Interval: every {POLL_INTERVAL_SECS // 60} min\n"
+        f"Signals: Volume, OI, Funding, Breakout, Turtle Zone, Failure Test\n"
         f"Alerts: only on significant signals\n"
         f"Started: {_now_utc()}"
     )
@@ -304,9 +391,17 @@ async def run_loop():
             except Exception as e:
                 logger.warning("Futures fetch failed: %s", e)
 
+            # ── Daily data for technical signals (cached, refreshed every POLL_TECHNICAL_SECS) ──
+            daily = None
+            try:
+                daily = await fetch_daily(client)
+                logger.debug("Daily candles: %d loaded (cached).", len(daily["closes"]))
+            except Exception as e:
+                logger.warning("Daily klines fetch failed: %s", e)
+
             # ── Evaluate & submit signals ─────────────────────────────────────
             try:
-                await evaluate_signals(spot, futures)
+                await evaluate_signals(spot, futures, daily)
             except Exception as e:
                 logger.error("Signal evaluation error: %s", e)
 
