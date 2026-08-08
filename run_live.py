@@ -89,8 +89,8 @@ _futures_available = None   # None = unknown, True = available, False = skip
 _shutdown = False
 
 # ── Daily-candle cache for technical signals (refreshed every POLL_TECHNICAL_SECS) ──
-_daily_cache: Optional[dict] = None
-_daily_cache_ts: float = 0.0
+# Keyed by symbol so ASTERUSDT and all coins in config.TECHNICAL_SYMBOLS cache independently.
+_daily_cache: dict = {}   # symbol -> {"data": {...}, "ts": float}
 
 
 # ════════════════════════════════════════════════
@@ -211,18 +211,18 @@ async def fetch_futures(client: httpx.AsyncClient) -> Optional[dict]:
     return result
 
 
-async def fetch_daily(client: httpx.AsyncClient) -> dict:
+async def fetch_daily(client: httpx.AsyncClient, symbol: str) -> dict:
     """Fetch daily candles for Donchian-based technical signals (Breakout,
-    Turtle Zone Filter, Failure Test). Cached for POLL_TECHNICAL_SECS since
-    daily data doesn't change meaningfully every 5 minutes."""
-    global _daily_cache, _daily_cache_ts
-
+    Turtle Zone Filter, Failure Test) for a given symbol. Cached per-symbol
+    for POLL_TECHNICAL_SECS since daily data doesn't change meaningfully
+    every 5 minutes."""
     now = time.monotonic()
-    if _daily_cache is not None and (now - _daily_cache_ts) < config.POLL_TECHNICAL_SECS:
-        return _daily_cache
+    cached = _daily_cache.get(symbol)
+    if cached is not None and (now - cached["ts"]) < config.POLL_TECHNICAL_SECS:
+        return cached["data"]
 
     r = await client.get(SPOT_KLINES_URL, params={
-        "symbol": config.SYMBOL_SPOT, "interval": "1d", "limit": config.DAILY_KLINES_LIMIT
+        "symbol": symbol, "interval": "1d", "limit": config.DAILY_KLINES_LIMIT
     })
     r.raise_for_status()
     rows = r.json()
@@ -231,8 +231,7 @@ async def fetch_daily(client: httpx.AsyncClient) -> dict:
         "lows":   [float(c[3]) for c in rows],
         "closes": [float(c[4]) for c in rows],
     }
-    _daily_cache = result
-    _daily_cache_ts = now
+    _daily_cache[symbol] = {"data": result, "ts": now}
     return result
 
 
@@ -303,18 +302,19 @@ async def evaluate_signals(spot: dict, futures: Optional[dict], daily: Optional[
                 message=tg.fmt_funding_alert(funding, funding_prev),
             ))
 
-    # ── Технические сигналы (daily) ───────────────────────────────────────────
+    # ── Технические сигналы (daily) — для основного SYMBOL_SPOT (ASTERUSDT) ────
     if daily:
         highs, lows, closes = daily["highs"], daily["lows"], daily["closes"]
+        symbol = config.SYMBOL_SPOT
 
         # Breakout
         bo = ts.detect_breakout(highs, lows, closes, n=config.DONCHIAN_LOOKBACK)
         if bo:
-            key = f"breakout_{'bull' if bo['direction'] == 'bullish' else 'bear'}"
+            key = f"breakout_{'bull' if bo['direction'] == 'bullish' else 'bear'}_{symbol}"
             await engine.submit(Signal(
                 key=key,
                 strong=True,
-                message=tg.fmt_breakout_alert(bo["direction"], bo["level"], bo["price"], bo["n"]),
+                message=tg.fmt_breakout_alert(symbol, bo["direction"], bo["level"], bo["price"], bo["n"]),
                 priority=2,
             ))
 
@@ -324,13 +324,13 @@ async def evaluate_signals(spot: dict, futures: Optional[dict], daily: Optional[
             fast=config.TURTLE_FAST_LOOKBACK, slow=config.TURTLE_SLOW_LOOKBACK,
         )
         if tzone:
-            key = f"turtle_zone_{'bull' if tzone['direction'] == 'bullish' else 'bear'}"
+            key = f"turtle_zone_{'bull' if tzone['direction'] == 'bullish' else 'bear'}_{symbol}"
             strong = tzone["stage"] == "confirmed"
             await engine.submit(Signal(
                 key=key,
                 strong=strong,
                 message=tg.fmt_turtle_zone_alert(
-                    tzone["direction"], tzone["stage"],
+                    symbol, tzone["direction"], tzone["stage"],
                     tzone["fast_level"], tzone["slow_level"], tzone["price"],
                 ),
                 priority=2,
@@ -342,11 +342,70 @@ async def evaluate_signals(spot: dict, futures: Optional[dict], daily: Optional[
             n=config.DONCHIAN_LOOKBACK, lookback=config.FAILURE_TEST_LOOKBACK,
         )
         if ft:
-            key = f"failure_test_{ft['direction'].lower()}"
+            key = f"failure_test_{ft['direction'].lower()}_{symbol}"
             await engine.submit(Signal(
                 key=key,
                 strong=True,
-                message=tg.fmt_failure_test_alert(ft["direction"], ft["level"], ft["price"]),
+                message=tg.fmt_failure_test_alert(symbol, ft["direction"], ft["level"], ft["price"]),
+                priority=2,
+            ))
+
+
+# ════════════════════════════════════════════════
+# MULTI-SYMBOL TECHNICAL SCAN (Breakout / Turtle Zone / Failure Test only)
+# ════════════════════════════════════════════════
+
+async def scan_technical_symbols(client: httpx.AsyncClient):
+    """Проходит по config.TECHNICAL_SYMBOLS и шлёт алерты ТОЛЬКО по трём
+    техническим индикаторам (Breakout, Turtle Zone Filter, Failure Test).
+    Никаких volume/OI/funding алертов для этих монет — они считаются
+    только для основного SYMBOL_SPOT (ASTERUSDT) в evaluate_signals()."""
+    for symbol in config.TECHNICAL_SYMBOLS:
+        try:
+            daily = await fetch_daily(client, symbol)
+        except Exception as e:
+            logger.warning("Daily klines fetch failed for %s: %s", symbol, e)
+            continue
+
+        highs, lows, closes = daily["highs"], daily["lows"], daily["closes"]
+
+        bo = ts.detect_breakout(highs, lows, closes, n=config.DONCHIAN_LOOKBACK)
+        if bo:
+            key = f"breakout_{'bull' if bo['direction'] == 'bullish' else 'bear'}_{symbol}"
+            await engine.submit(Signal(
+                key=key,
+                strong=True,
+                message=tg.fmt_breakout_alert(symbol, bo["direction"], bo["level"], bo["price"], bo["n"]),
+                priority=2,
+            ))
+
+        tzone = ts.detect_turtle_zone(
+            highs, lows, closes,
+            fast=config.TURTLE_FAST_LOOKBACK, slow=config.TURTLE_SLOW_LOOKBACK,
+        )
+        if tzone:
+            key = f"turtle_zone_{'bull' if tzone['direction'] == 'bullish' else 'bear'}_{symbol}"
+            strong = tzone["stage"] == "confirmed"
+            await engine.submit(Signal(
+                key=key,
+                strong=strong,
+                message=tg.fmt_turtle_zone_alert(
+                    symbol, tzone["direction"], tzone["stage"],
+                    tzone["fast_level"], tzone["slow_level"], tzone["price"],
+                ),
+                priority=2,
+            ))
+
+        ft = ts.detect_failure_test(
+            highs, lows, closes,
+            n=config.DONCHIAN_LOOKBACK, lookback=config.FAILURE_TEST_LOOKBACK,
+        )
+        if ft:
+            key = f"failure_test_{ft['direction'].lower()}_{symbol}"
+            await engine.submit(Signal(
+                key=key,
+                strong=True,
+                message=tg.fmt_failure_test_alert(symbol, ft["direction"], ft["level"], ft["price"]),
                 priority=2,
             ))
 
@@ -366,6 +425,7 @@ async def run_loop():
     logger.info("=" * 60)
     logger.info("  Aster Intelligence Bot — LIVE MODE")
     logger.info("  Symbol:   %s", config.SYMBOL_SPOT)
+    logger.info("  Technical-only symbols: %s", ", ".join(config.TECHNICAL_SYMBOLS))
     logger.info("  Interval: %ds", POLL_INTERVAL_SECS)
     logger.info("  Cooldown: %ds per signal type", config.ALERT_COOLDOWN_SECS)
     logger.info("  Log file: logs/aster_bot.log")
@@ -373,9 +433,9 @@ async def run_loop():
 
     await tg.send_alert(
         "🟢 <b>Aster Bot — Live Mode Started</b>\n\n"
-        f"Symbol: <code>{config.SYMBOL_SPOT}</code>\n"
+        f"Main symbol: <code>{config.SYMBOL_SPOT}</code> — Volume, OI, Funding, Breakout, Turtle Zone, Failure Test\n"
+        f"Technical-only: <code>{', '.join(config.TECHNICAL_SYMBOLS)}</code> — Breakout, Turtle Zone, Failure Test\n"
         f"Interval: every {POLL_INTERVAL_SECS // 60} min\n"
-        f"Signals: Volume, OI, Funding, Breakout, Turtle Zone, Failure Test\n"
         f"Alerts: only on significant signals\n"
         f"Started: {_now_utc()}"
     )
@@ -424,16 +484,22 @@ async def run_loop():
             # ── Daily data for technical signals (cached, refreshed every POLL_TECHNICAL_SECS) ──
             daily = None
             try:
-                daily = await fetch_daily(client)
+                daily = await fetch_daily(client, config.SYMBOL_SPOT)
                 logger.debug("Daily candles: %d loaded (cached).", len(daily["closes"]))
             except Exception as e:
                 logger.warning("Daily klines fetch failed: %s", e)
 
-            # ── Evaluate & submit signals ─────────────────────────────────────
+            # ── Evaluate & submit signals (ASTER: volume/OI/funding + technical) ──
             try:
                 await evaluate_signals(spot, futures, daily)
             except Exception as e:
                 logger.error("Signal evaluation error: %s", e)
+
+            # ── Multi-symbol technical scan (Breakout/Turtle Zone/Failure Test only) ──
+            try:
+                await scan_technical_symbols(client)
+            except Exception as e:
+                logger.error("Multi-symbol technical scan error: %s", e)
 
             # ── Sleep until next interval ─────────────────────────────────────
             elapsed = time.monotonic() - t_start

@@ -54,6 +54,19 @@ FAILURE_TEST_LOOKBACK = int(os.environ.get("FAILURE_TEST_LOOKBACK", "5"))   # б
 DAILY_KLINES_LIMIT    = int(os.environ.get("DAILY_KLINES_LIMIT",    "90"))  # дневных свечей на загрузку
 POLL_TECHNICAL_SECS   = int(os.environ.get("POLL_TECHNICAL_SECS",   "900")) # 15 мин — дневные данные не нужно чаще
 
+# Список монет, по которым Breakout / Turtle Zone Filter / Failure Test
+# сканируются ОТДЕЛЬНО от основного SYMBOL_SPOT (ASTERUSDT). Для этих монет
+# шлются только сигналы этих трёх индикаторов — без volume/OI/funding.
+TECHNICAL_SYMBOLS = [
+    s.strip().upper()
+    for s in os.environ.get(
+        "TECHNICAL_SYMBOLS",
+        "SOLUSDT,LINKUSDT,ETHUSDT,BTCUSDT,XRPUSDT,XLMUSDT,HYPERUSDT,"
+        "ADAUSDT,DOGEUSDT,PEPEUSDT,PENGUUSDT,CAPUSDT",
+    ).split(",")
+    if s.strip()
+]
+
 # ── Polling intervals (seconds) ──────────────────────────────────────────────
 POLL_PRICE_SECS    = int(os.environ.get("POLL_PRICE_SECS",   "60"))
 POLL_OI_SECS       = int(os.environ.get("POLL_OI_SECS",      "60"))
