@@ -455,11 +455,11 @@ async def run_loop():
                 spot = await fetch_spot(client)
                 logger.info(
                     "SPOT  price=$%.6f  24h=%+.2f%%  vol_ratio=%.2f×  "
-                    "24hVol=$%,.0f",
+                    "24hVol=$%s",
                     spot["price"],
                     spot["change_24h"],
                     spot["vol_1h_ratio"],
-                    spot["vol_quote_24h"],
+                    f"{spot['vol_quote_24h']:,.0f}",
                 )
             except Exception as e:
                 logger.error("Spot fetch failed: %s", e)
