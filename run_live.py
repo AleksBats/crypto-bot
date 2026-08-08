@@ -31,8 +31,10 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -89,6 +91,34 @@ _shutdown = False
 # ── Daily-candle cache for technical signals (refreshed every POLL_TECHNICAL_SECS) ──
 _daily_cache: Optional[dict] = None
 _daily_cache_ts: float = 0.0
+
+
+# ════════════════════════════════════════════════
+# HEALTH-CHECK HTTP SERVER (для бесплатного Web Service на Render)
+# ════════════════════════════════════════════════
+# Render (бесплатный тариф) поддерживает только "Web Service" — требует, чтобы
+# приложение слушало $PORT и отвечало на HTTP-запросы, иначе деплой считается
+# нездоровым. Бот сам по себе — это asyncio-цикл без веб-сервера, поэтому
+# поднимаем крошечный HTTP-сервер в отдельном потоке ТОЛЬКО ради health check —
+# он никак не влияет на логику сигналов и алертов.
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"status": "alive", "service": "aster-intelligence-bot"}')
+
+    def log_message(self, format, *args):
+        pass  # не засоряем логи health-check запросами
+
+
+def _start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logging.getLogger("run_live").info("Health-check server listening on :%d", port)
 
 
 # ════════════════════════════════════════════════
@@ -429,6 +459,10 @@ async def shutdown(reason: str = "manual stop"):
 
 async def main():
     loop = asyncio.get_running_loop()
+
+    # Health-check сервер для Render Web Service (бесплатный тариф) — не мешает
+    # основному циклу, просто отвечает "alive" на HTTP-пинги платформы.
+    _start_health_server()
 
     # Handle Ctrl+C and kill signals gracefully
     for sig in (signal.SIGINT, signal.SIGTERM):
