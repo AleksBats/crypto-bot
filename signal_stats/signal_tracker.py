@@ -92,12 +92,13 @@ async def record_signal(
     symbol: str, direction: str, setup: str,
     entry_price: float, entry_level: float, fast_n: int,
     highs: list[float], lows: list[float], closes: list[float],
+    timeframe: str = "1d", candle_close_ts: Optional[int] = None,
     store=_default_store,
 ) -> Optional[str]:
     """Records a fired-and-actually-sent signal. Returns the new signal id,
     the id of an existing OPEN duplicate (dedup — see module docstring), or
     None if the store is unavailable (DATABASE_URL not set)."""
-    existing = await store.find_open_duplicate(symbol, setup, direction, entry_level)
+    existing = await store.find_open_duplicate(symbol, setup, direction, entry_level, timeframe)
     if existing is not None:
         return existing["id"]
 
@@ -120,6 +121,7 @@ async def record_signal(
         id=sid, fired_at=datetime.now(timezone.utc), symbol=symbol, direction=direction,
         setup=setup, entry_price=entry_price, entry_level=entry_level, fast_n=fast_n,
         initial_risk_pct=initial_risk_pct, rsi_at_entry=rsi_at_entry,
+        timeframe=timeframe, candle_close_ts=candle_close_ts,
     )
     if row is None:
         return None
@@ -128,7 +130,9 @@ async def record_signal(
 
 # ── resolution ───────────────────────────────────────────────────────────────
 
-async def resolve_open_signals(symbol: str, highs: list[float], lows: list[float], closes: list[float], store=_default_store):
+async def resolve_open_signals(symbol: str, highs: list[float], lows: list[float],
+                                closes: list[float], timeframe: str = "1d",
+                                store=_default_store):
     """Re-checks every OPEN signal for this symbol against the latest daily
     candles fetched by run_live.py. Call once per daily-cache refresh, same
     cadence as the old prototype's evaluate_pending()."""
@@ -138,7 +142,9 @@ async def resolve_open_signals(symbol: str, highs: list[float], lows: list[float
     slow_upper, slow_lower = _donchian(highs, lows, config.TURTLE_SLOW_LOOKBACK)
     price = closes[-1]
 
-    open_signals = await store.get_open_signals(symbol=symbol)
+    # Резолвим только сигналы СВОЕГО таймфрейма: дневной сигнал нельзя
+    # закрывать по часовым уровням Дончиана и наоборот.
+    open_signals = await store.get_open_signals(symbol=symbol, timeframe=timeframe)
     for rec in open_signals:
         direction = rec["direction"]
         entry_price = rec["entry_price"]

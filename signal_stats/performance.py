@@ -7,8 +7,9 @@ weekly/monthly/all-time reports need. No I/O, no database — easy to unit
 test with synthetic rows.
 
 Deliberate omissions (see reports.py for how these surface as N/A):
-- No timeframe breakdown: every row has timeframe == "1d", there's nothing
-  to break down. Not computed here at all.
+- Timeframe breakdown IS computed now (`by_timeframe`) — since the hourly
+  contour was added, `timeframe` genuinely varies between "1d" and "1h".
+  Before that it was deliberately omitted as an honest N/A.
 - No indicator-confluence score beyond `setup` (which already includes
   "breakout_turtle_combo" when both fired the same day — see
   signal_tracker.decide_breakout_turtle_setup). No separate "confluence"
@@ -95,6 +96,7 @@ def aggregate(signals: list[dict]) -> dict:
     profit_factor = (sum_win_r / abs(sum_loss_r)) if loss_r and sum_loss_r != 0 else None
 
     by_symbol = _group_breakdown(closed, "symbol")
+    by_timeframe = _group_breakdown(closed, "timeframe")
     by_setup = _group_breakdown(closed, "setup")
     best_symbol, worst_symbol = _best_worst_by_win_rate(by_symbol)
     best_setup, worst_setup = _best_worst_by_win_rate(by_setup)
@@ -125,6 +127,7 @@ def aggregate(signals: list[dict]) -> dict:
         "worst_signal": worst_signal,
 
         "by_symbol": by_symbol,
+        "by_timeframe": by_timeframe,
         "by_setup": by_setup,
         "best_symbol": best_symbol,
         "worst_symbol": worst_symbol,

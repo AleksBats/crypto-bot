@@ -8,9 +8,14 @@ Signals monitored:
   - Volume spike (1h volume vs average)
   - Open Interest change
   - Funding rate extremes
-  - Breakout          (daily Donchian channel break)
+  - Breakout          (Donchian channel break)
   - Turtle Zone Filter (dual-channel Turtle-style system)
   - Failure Test       (false-breakout / trap detector)
+
+Технические индикаторы считаются на ДВУХ таймфреймах параллельно (1D и 1H)
+и ТОЛЬКО по закрытым свечам. В сообщении показываются две отдельные цены:
+цена свечи, создавшей сигнал, и свежая рыночная цена на момент отправки.
+Повторная отправка того же сигнала по той же свече исключена. См. DECISIONS.md #13.
 
 Every Breakout / Turtle Zone / Failure Test alert that is ACTUALLY sent to
 Telegram (i.e. survives alert_engine's cooldown) is also recorded in the
@@ -99,9 +104,25 @@ FUT_FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
 _futures_available = None   # None = unknown, True = available, False = skip
 _shutdown = False
 
-# ── Daily-candle cache for technical signals (refreshed every POLL_TECHNICAL_SECS) ──
-# Keyed by symbol so ASTERUSDT and all coins in config.TECHNICAL_SYMBOLS cache independently.
-_daily_cache: dict = {}   # symbol -> {"data": {...}, "ts": float}
+# ── Кэш свечей: ключ (symbol, interval) ──────────────────────────────────────
+# Дневные и часовые кэшируются независимо и с разным TTL (config.POLL_TECHNICAL_SECS
+# и config.POLL_HOURLY_SECS соответственно).
+_klines_cache: dict = {}   # (symbol, interval) -> {"data": {...}, "ts": float}
+
+# ── Дедупликация отправленных сигналов ПО СВЕЧЕ ──────────────────────────────
+# Ключ — (symbol, timeframe, setup, direction), значение — close_time свечи,
+# по которой сигнал уже был отправлен. Повторная отправка возможна только
+# когда появилась НОВАЯ свеча с тем же условием.
+#
+# Зачем: cooldown в alert_engine — это rate limiting ("не чаще раза в 30 мин"),
+# а не дедупликация. Условие Failure Test остаётся истинным сутками, и каждые
+# 30 минут по истечении cooldown улетало одно и то же сообщение с одной и той
+# же ценой. См. DECISIONS.md #13.
+#
+# Хранится в памяти процесса: после рестарта Render возможна ОДНА повторная
+# отправка на свечу. Это осознанный компромисс — иначе пришлось бы делать
+# дедупликацию зависимой от наличия БД, а бот обязан работать и без неё.
+_sent_signal_candles: dict = {}   # (symbol, timeframe, setup, direction) -> close_time ms
 
 
 # ════════════════════════════════════════════════
@@ -222,79 +243,208 @@ async def fetch_futures(client: httpx.AsyncClient) -> Optional[dict]:
     return result
 
 
-async def fetch_daily(client: httpx.AsyncClient, symbol: str) -> dict:
-    """Fetch daily candles for Donchian-based technical signals (Breakout,
-    Turtle Zone Filter, Failure Test) for a given symbol. Cached per-symbol
-    for POLL_TECHNICAL_SECS since daily data doesn't change meaningfully
-    every 5 minutes."""
+async def fetch_klines(client: httpx.AsyncClient, symbol: str, interval: str,
+                        limit: int, cache_ttl: int) -> dict:
+    """Загружает свечи и возвращает ТОЛЬКО ЗАКРЫТЫЕ.
+
+    Ключевое отличие от прежней fetch_daily(): Binance возвращает последним
+    элементом ТЕКУЩУЮ, ещё формирующуюся свечу. Раньше она попадала в
+    индикаторы, из-за чего сигнал мог объявиться в середине свечи и потом
+    "передумать". Теперь незакрытые свечи отбрасываются по close_time —
+    сигнал физически не может появиться до закрытия своей свечи.
+    См. DECISIONS.md #13.
+
+    Формат kline: [open_time, open, high, low, close, volume, close_time, ...]
+    """
+    cache_key = (symbol, interval)
     now = time.monotonic()
-    cached = _daily_cache.get(symbol)
-    if cached is not None and (now - cached["ts"]) < config.POLL_TECHNICAL_SECS:
+    cached = _klines_cache.get(cache_key)
+    if cached is not None and (now - cached["ts"]) < cache_ttl:
         return cached["data"]
 
     r = await client.get(SPOT_KLINES_URL, params={
-        "symbol": symbol, "interval": "1d", "limit": config.DAILY_KLINES_LIMIT
+        "symbol": symbol, "interval": interval, "limit": limit
     })
     r.raise_for_status()
     rows = r.json()
+
+    # Отбрасываем незакрытые свечи по фактическому close_time, а не «срезаем
+    # последнюю вслепую» — так корректно обрабатываются пограничные случаи.
+    now_ms = time.time() * 1000
+    closed = [c for c in rows if float(c[6]) <= now_ms]
+
     result = {
-        "highs":  [float(c[2]) for c in rows],
-        "lows":   [float(c[3]) for c in rows],
-        "closes": [float(c[4]) for c in rows],
+        "highs":       [float(c[2]) for c in closed],
+        "lows":        [float(c[3]) for c in closed],
+        "closes":      [float(c[4]) for c in closed],
+        "close_times": [int(c[6]) for c in closed],
     }
-    _daily_cache[symbol] = {"data": result, "ts": now}
+    _klines_cache[cache_key] = {"data": result, "ts": now}
     return result
 
 
+async def fetch_current_price(client: httpx.AsyncClient, symbol: str) -> Optional[float]:
+    """Свежая рыночная цена НЕПОСРЕДСТВЕННО перед отправкой в Telegram.
+
+    Отдельный лёгкий запрос — только когда сигнал реально собирается уходить,
+    не на каждой итерации цикла. Возвращает None при любой ошибке: цена в
+    сообщении тогда честно помечается как недоступная, но сам сигнал всё
+    равно отправляется."""
+    try:
+        r = await client.get(SPOT_PRICE_URL, params={"symbol": symbol}, timeout=8)
+        r.raise_for_status()
+        return float(r.json()["price"])
+    except Exception as e:
+        logger.warning("Не удалось получить свежую цену для %s: %s", symbol, e)
+        return None
+
+
+def _is_new_candle_signal(symbol: str, timeframe: str, setup: str,
+                           direction: str, candle_close_ts: int) -> bool:
+    """True, если по этой свече такой сигнал ещё не отправлялся.
+    Побочно запоминает свечу — вызывать только когда сигнал действительно
+    собирается уходить в Telegram."""
+    key = (symbol, timeframe, setup, direction)
+    last = _sent_signal_candles.get(key)
+    if last is not None and candle_close_ts <= last:
+        return False
+    _sent_signal_candles[key] = candle_close_ts
+    return True
+
+
 # ════════════════════════════════════════════════
-# STATISTICS RECORDING HELPER (shared by evaluate_signals + scan_technical_symbols)
+# ЕДИНЫЙ ТЕХНИЧЕСКИЙ СКАН (Breakout / Turtle Zone / Failure Test)
 # ════════════════════════════════════════════════
+# Один и тот же код обслуживает и дневной, и часовой контур, и основной
+# символ, и остальные монеты. Раньше эта логика была продублирована в
+# evaluate_signals() и scan_technical_symbols(), что при добавлении 1H
+# означало бы четыре копии. См. DECISIONS.md #13.
 
-async def _record_technical_stats(
-    symbol: str, highs: list[float], lows: list[float], closes: list[float],
-    bo: Optional[dict], sent_breakout: bool,
-    tzone: Optional[dict], sent_turtle: bool,
-):
-    """Records Breakout/Turtle Zone signals into signal_stats/, merging same-day
-    same-direction Breakout+Turtle into one combo row instead of two rows —
-    see signal_stats/signal_tracker.decide_breakout_turtle_setup and
-    DECISIONS.md #12. Never raises — a statistics failure must never affect
-    alerting, so every call site wraps this in its own try/except too."""
-    bo_direction = ("LONG" if bo["direction"] == "bullish" else "SHORT") if bo else None
-    tzone_direction = ("LONG" if tzone["direction"] == "bullish" else "SHORT") if tzone else None
+async def _emit(client: httpx.AsyncClient, symbol: str, timeframe: str, setup: str,
+                direction: str, message_builder, signal_price: float, entry_level: float,
+                fast_n: int, candle_close_ts: int, strong: bool,
+                highs: list, lows: list, closes: list) -> bool:
+    """Дедуп по свече → свежая цена → отправка → запись в статистику.
 
-    combo_setup = None
-    if bo_direction is not None and bo_direction == tzone_direction:
-        combo_setup = stats_tracker.decide_breakout_turtle_setup(sent_breakout, sent_turtle)
+    Порядок важен: свежая цена запрашивается ТОЛЬКО после того, как дедуп
+    пропустил сигнал — иначе на каждой итерации летели бы лишние запросы."""
+    if not _is_new_candle_signal(symbol, timeframe, setup, direction, candle_close_ts):
+        return False
 
-    if combo_setup:
+    current_price = await fetch_current_price(client, symbol)
+    key = f"{setup}_{direction.lower()}_{symbol}_{timeframe}"
+    sent = await engine.submit(Signal(
+        key=key, strong=strong, message=message_builder(current_price), priority=2,
+    ))
+    if not sent:
+        return False
+
+    try:
         await stats_tracker.record_signal(
-            symbol=symbol, direction=tzone_direction, setup=combo_setup,
-            entry_price=tzone["price"], entry_level=tzone["fast_level"],
-            fast_n=config.TURTLE_FAST_LOOKBACK, highs=highs, lows=lows, closes=closes,
+            symbol=symbol, direction=direction, setup=setup,
+            entry_price=signal_price, entry_level=entry_level, fast_n=fast_n,
+            highs=highs, lows=lows, closes=closes,
+            timeframe=timeframe, candle_close_ts=candle_close_ts,
         )
+    except Exception as e:
+        logger.error("statistics: record_signal failed (%s %s %s): %s", symbol, setup, timeframe, e)
+    return True
+
+
+async def scan_technical(client: httpx.AsyncClient, symbol: str, timeframe: str,
+                          limit: int, cache_ttl: int):
+    """Считает три индикатора по ЗАКРЫТЫМ свечам заданного таймфрейма."""
+    try:
+        data = await fetch_klines(client, symbol, timeframe, limit, cache_ttl)
+    except Exception as e:
+        logger.warning("Klines fetch failed for %s %s: %s", symbol, timeframe, e)
         return
 
-    if sent_breakout:
-        await stats_tracker.record_signal(
-            symbol=symbol, direction=bo_direction, setup="breakout",
-            entry_price=bo["price"], entry_level=bo["level"],
-            fast_n=config.DONCHIAN_LOOKBACK, highs=highs, lows=lows, closes=closes,
+    highs, lows, closes = data["highs"], data["lows"], data["closes"]
+    if not closes:
+        return
+    candle_close_ts = data["close_times"][-1]
+
+    # Резолюция ранее записанных OPEN-сигналов (слой статистики, на алерты не влияет)
+    try:
+        await stats_tracker.resolve_open_signals(symbol, highs, lows, closes, timeframe=timeframe)
+    except Exception as e:
+        logger.error("statistics: resolve_open_signals failed for %s %s: %s", symbol, timeframe, e)
+
+    # ── Breakout ─────────────────────────────────────────────────────────────
+    bo = ts.detect_breakout(highs, lows, closes, n=config.DONCHIAN_LOOKBACK)
+    sent_breakout = False
+    if bo:
+        direction = "LONG" if bo["direction"] == "bullish" else "SHORT"
+        sent_breakout = await _emit(
+            client, symbol, timeframe, "breakout", direction,
+            lambda cp: tg.fmt_breakout_alert(symbol, bo["direction"], bo["level"],
+                                              bo["price"], bo["n"], timeframe, cp),
+            signal_price=bo["price"], entry_level=bo["level"],
+            fast_n=config.DONCHIAN_LOOKBACK, candle_close_ts=candle_close_ts,
+            strong=True, highs=highs, lows=lows, closes=closes,
         )
-    if sent_turtle:
-        await stats_tracker.record_signal(
-            symbol=symbol, direction=tzone_direction, setup="turtle_zone",
-            entry_price=tzone["price"], entry_level=tzone["fast_level"],
-            fast_n=config.TURTLE_FAST_LOOKBACK, highs=highs, lows=lows, closes=closes,
+
+    # ── Turtle Zone Filter ───────────────────────────────────────────────────
+    tzone = ts.detect_turtle_zone(
+        highs, lows, closes,
+        fast=config.TURTLE_FAST_LOOKBACK, slow=config.TURTLE_SLOW_LOOKBACK,
+    )
+    if tzone:
+        direction = "LONG" if tzone["direction"] == "bullish" else "SHORT"
+        # Комбо: оба детектора сработали на одной свече в одну сторону, и
+        # Breakout уже реально ушёл в Telegram — пишем в статистику как один
+        # combo-сетап вместо двух строк (см. DECISIONS.md #12).
+        setup = ("breakout_turtle_combo"
+                 if (sent_breakout and bo and direction ==
+                     ("LONG" if bo["direction"] == "bullish" else "SHORT"))
+                 else "turtle_zone")
+        await _emit(
+            client, symbol, timeframe, setup, direction,
+            lambda cp: tg.fmt_turtle_zone_alert(symbol, tzone["direction"], tzone["stage"],
+                                                 tzone["fast_level"], tzone["slow_level"],
+                                                 tzone["price"], timeframe, cp),
+            signal_price=tzone["price"], entry_level=tzone["fast_level"],
+            fast_n=config.TURTLE_FAST_LOOKBACK, candle_close_ts=candle_close_ts,
+            strong=(tzone["stage"] == "confirmed"), highs=highs, lows=lows, closes=closes,
         )
+
+    # ── Failure Test ─────────────────────────────────────────────────────────
+    ft = ts.detect_failure_test(
+        highs, lows, closes,
+        n=config.DONCHIAN_LOOKBACK, lookback=config.FAILURE_TEST_LOOKBACK,
+    )
+    if ft:
+        await _emit(
+            client, symbol, timeframe, "failure_test", ft["direction"],
+            lambda cp: tg.fmt_failure_test_alert(symbol, ft["direction"], ft["level"],
+                                                  ft["price"], timeframe, cp),
+            signal_price=ft["price"], entry_level=ft["level"],
+            fast_n=config.DONCHIAN_LOOKBACK, candle_close_ts=candle_close_ts,
+            strong=True, highs=highs, lows=lows, closes=closes,
+        )
+
+
+async def scan_all_technical(client: httpx.AsyncClient):
+    """Основной символ + все TECHNICAL_SYMBOLS, дневной и часовой контуры."""
+    symbols = [config.SYMBOL_SPOT] + [s for s in config.TECHNICAL_SYMBOLS if s != config.SYMBOL_SPOT]
+    for symbol in symbols:
+        await scan_technical(client, symbol, "1d",
+                             config.DAILY_KLINES_LIMIT, config.POLL_TECHNICAL_SECS)
+        if config.ENABLE_HOURLY_SIGNALS:
+            await scan_technical(client, symbol, "1h",
+                                 config.HOURLY_KLINES_LIMIT, config.POLL_HOURLY_SECS)
 
 
 # ════════════════════════════════════════════════
-# SIGNAL EVALUATION
+# SIGNAL EVALUATION (volume / OI / funding — только основной символ)
 # ════════════════════════════════════════════════
 
-async def evaluate_signals(spot: dict, futures: Optional[dict], daily: Optional[dict]):
-    """Check all thresholds and submit signals to alert_engine."""
+async def evaluate_signals(spot: dict, futures: Optional[dict]):
+    """Volume / OI / funding сигналы по основному символу.
+
+    Технические индикаторы здесь БОЛЬШЕ НЕ считаются — они вынесены в
+    scan_technical(), общий для всех символов и обоих таймфреймов."""
     price = spot["price"]
 
     # ── Update shared state ───────────────────────────────────────────────────
@@ -356,158 +506,6 @@ async def evaluate_signals(spot: dict, futures: Optional[dict], daily: Optional[
                 message=tg.fmt_funding_alert(funding, funding_prev),
             ))
 
-    # ── Технические сигналы (daily) — для основного SYMBOL_SPOT (ASTERUSDT) ────
-    if daily:
-        highs, lows, closes = daily["highs"], daily["lows"], daily["closes"]
-        symbol = config.SYMBOL_SPOT
-
-        # Re-check previously recorded OPEN signals against the latest daily
-        # candles before looking for new ones (statistics layer only — does
-        # not affect alerting). See signal_stats/signal_tracker.py.
-        try:
-            await stats_tracker.resolve_open_signals(symbol, highs, lows, closes)
-        except Exception as e:
-            logger.error("statistics: resolve_open_signals failed for %s: %s", symbol, e)
-
-        # Breakout
-        bo = ts.detect_breakout(highs, lows, closes, n=config.DONCHIAN_LOOKBACK)
-        sent_breakout = False
-        if bo:
-            key = f"breakout_{'bull' if bo['direction'] == 'bullish' else 'bear'}_{symbol}"
-            sent_breakout = await engine.submit(Signal(
-                key=key,
-                strong=True,
-                message=tg.fmt_breakout_alert(symbol, bo["direction"], bo["level"], bo["price"], bo["n"]),
-                priority=2,
-            ))
-
-        # Turtle Zone Filter
-        tzone = ts.detect_turtle_zone(
-            highs, lows, closes,
-            fast=config.TURTLE_FAST_LOOKBACK, slow=config.TURTLE_SLOW_LOOKBACK,
-        )
-        sent_turtle = False
-        if tzone:
-            key = f"turtle_zone_{'bull' if tzone['direction'] == 'bullish' else 'bear'}_{symbol}"
-            strong = tzone["stage"] == "confirmed"
-            sent_turtle = await engine.submit(Signal(
-                key=key,
-                strong=strong,
-                message=tg.fmt_turtle_zone_alert(
-                    symbol, tzone["direction"], tzone["stage"],
-                    tzone["fast_level"], tzone["slow_level"], tzone["price"],
-                ),
-                priority=2,
-            ))
-
-        try:
-            await _record_technical_stats(symbol, highs, lows, closes, bo, sent_breakout, tzone, sent_turtle)
-        except Exception as e:
-            logger.error("statistics: record_signal failed for %s: %s", symbol, e)
-
-        # Failure Test
-        ft = ts.detect_failure_test(
-            highs, lows, closes,
-            n=config.DONCHIAN_LOOKBACK, lookback=config.FAILURE_TEST_LOOKBACK,
-        )
-        if ft:
-            key = f"failure_test_{ft['direction'].lower()}_{symbol}"
-            sent_ft = await engine.submit(Signal(
-                key=key,
-                strong=True,
-                message=tg.fmt_failure_test_alert(symbol, ft["direction"], ft["level"], ft["price"]),
-                priority=2,
-            ))
-            if sent_ft:
-                try:
-                    await stats_tracker.record_signal(
-                        symbol=symbol, direction=ft["direction"], setup="failure_test",
-                        entry_price=ft["price"], entry_level=ft["level"],
-                        fast_n=config.DONCHIAN_LOOKBACK, highs=highs, lows=lows, closes=closes,
-                    )
-                except Exception as e:
-                    logger.error("statistics: record_signal failed (failure_test) for %s: %s", symbol, e)
-
-
-# ════════════════════════════════════════════════
-# MULTI-SYMBOL TECHNICAL SCAN (Breakout/Turtle Zone/Failure Test only)
-# ════════════════════════════════════════════════
-
-async def scan_technical_symbols(client: httpx.AsyncClient):
-    """Проходит по config.TECHNICAL_SYMBOLS и шлёт алерты ТОЛЬКО по трём
-    техническим индикаторам (Breakout, Turtle Zone Filter, Failure Test).
-    Никаких volume/OI/funding алертов для этих монет — они считаются
-    только для основного SYMBOL_SPOT (ASTERUSDT) в evaluate_signals()."""
-    for symbol in config.TECHNICAL_SYMBOLS:
-        try:
-            daily = await fetch_daily(client, symbol)
-        except Exception as e:
-            logger.warning("Daily klines fetch failed for %s: %s", symbol, e)
-            continue
-
-        highs, lows, closes = daily["highs"], daily["lows"], daily["closes"]
-
-        try:
-            await stats_tracker.resolve_open_signals(symbol, highs, lows, closes)
-        except Exception as e:
-            logger.error("statistics: resolve_open_signals failed for %s: %s", symbol, e)
-
-        bo = ts.detect_breakout(highs, lows, closes, n=config.DONCHIAN_LOOKBACK)
-        sent_breakout = False
-        if bo:
-            key = f"breakout_{'bull' if bo['direction'] == 'bullish' else 'bear'}_{symbol}"
-            sent_breakout = await engine.submit(Signal(
-                key=key,
-                strong=True,
-                message=tg.fmt_breakout_alert(symbol, bo["direction"], bo["level"], bo["price"], bo["n"]),
-                priority=2,
-            ))
-
-        tzone = ts.detect_turtle_zone(
-            highs, lows, closes,
-            fast=config.TURTLE_FAST_LOOKBACK, slow=config.TURTLE_SLOW_LOOKBACK,
-        )
-        sent_turtle = False
-        if tzone:
-            key = f"turtle_zone_{'bull' if tzone['direction'] == 'bullish' else 'bear'}_{symbol}"
-            strong = tzone["stage"] == "confirmed"
-            sent_turtle = await engine.submit(Signal(
-                key=key,
-                strong=strong,
-                message=tg.fmt_turtle_zone_alert(
-                    symbol, tzone["direction"], tzone["stage"],
-                    tzone["fast_level"], tzone["slow_level"], tzone["price"],
-                ),
-                priority=2,
-            ))
-
-        try:
-            await _record_technical_stats(symbol, highs, lows, closes, bo, sent_breakout, tzone, sent_turtle)
-        except Exception as e:
-            logger.error("statistics: record_signal failed for %s: %s", symbol, e)
-
-        ft = ts.detect_failure_test(
-            highs, lows, closes,
-            n=config.DONCHIAN_LOOKBACK, lookback=config.FAILURE_TEST_LOOKBACK,
-        )
-        if ft:
-            key = f"failure_test_{ft['direction'].lower()}_{symbol}"
-            sent_ft = await engine.submit(Signal(
-                key=key,
-                strong=True,
-                message=tg.fmt_failure_test_alert(symbol, ft["direction"], ft["level"], ft["price"]),
-                priority=2,
-            ))
-            if sent_ft:
-                try:
-                    await stats_tracker.record_signal(
-                        symbol=symbol, direction=ft["direction"], setup="failure_test",
-                        entry_price=ft["price"], entry_level=ft["level"],
-                        fast_n=config.DONCHIAN_LOOKBACK, highs=highs, lows=lows, closes=closes,
-                    )
-                except Exception as e:
-                    logger.error("statistics: record_signal failed (failure_test) for %s: %s", symbol, e)
-
 
 # ════════════════════════════════════════════════
 # MAIN LOOP
@@ -525,6 +523,8 @@ async def run_loop():
     logger.info("  Aster Intelligence Bot — LIVE MODE")
     logger.info("  Symbol:   %s", config.SYMBOL_SPOT)
     logger.info("  Technical-only symbols: %s", ", ".join(config.TECHNICAL_SYMBOLS))
+    logger.info("  Timeframes: 1d%s (только ЗАКРЫТЫЕ свечи)",
+                " + 1h" if config.ENABLE_HOURLY_SIGNALS else "")
     logger.info("  Interval: %ds", POLL_INTERVAL_SECS)
     logger.info("  Cooldown: %ds per signal type", config.ALERT_COOLDOWN_SECS)
     logger.info("  Statistics DB: %s", "configured" if config.DATABASE_URL else "NOT configured (statistics disabled)")
@@ -581,25 +581,17 @@ async def run_loop():
             except Exception as e:
                 logger.warning("Futures fetch failed: %s", e)
 
-            # ── Daily data for technical signals (cached, refreshed every POLL_TECHNICAL_SECS) ──
-            daily = None
+            # ── Volume / OI / funding по основному символу ─────────────────────
             try:
-                daily = await fetch_daily(client, config.SYMBOL_SPOT)
-                logger.debug("Daily candles: %d loaded (cached).", len(daily["closes"]))
-            except Exception as e:
-                logger.warning("Daily klines fetch failed: %s", e)
-
-            # ── Evaluate & submit signals (ASTER: volume/OI/funding + technical) ──
-            try:
-                await evaluate_signals(spot, futures, daily)
+                await evaluate_signals(spot, futures)
             except Exception as e:
                 logger.error("Signal evaluation error: %s", e)
 
-            # ── Multi-symbol technical scan (Breakout/Turtle Zone/Failure Test only) ──
+            # ── Технический скан: все символы × (1D и 1H), только закрытые свечи ──
             try:
-                await scan_technical_symbols(client)
+                await scan_all_technical(client)
             except Exception as e:
-                logger.error("Multi-symbol technical scan error: %s", e)
+                logger.error("Technical scan error: %s", e)
 
             # ── Sleep until next interval ─────────────────────────────────────
             elapsed = time.monotonic() - t_start

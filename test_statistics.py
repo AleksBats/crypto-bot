@@ -45,21 +45,23 @@ class InMemoryStore:
     def __init__(self):
         self.rows: dict[str, dict] = {}
 
-    async def find_open_duplicate(self, symbol, setup, direction, entry_level):
+    async def find_open_duplicate(self, symbol, setup, direction, entry_level, timeframe="1d"):
         for r in self.rows.values():
             if (r["status"] == "OPEN" and r["symbol"] == symbol and r["setup"] == setup
-                    and r["direction"] == direction and r["entry_level"] == entry_level):
+                    and r["direction"] == direction and r["entry_level"] == entry_level
+                    and r["timeframe"] == timeframe):
                 return dict(r)
         return None
 
     async def insert_signal(self, id, fired_at, symbol, direction, setup,
                              entry_price, entry_level, fast_n, initial_risk_pct,
-                             rsi_at_entry, timeframe="1d"):
+                             rsi_at_entry, timeframe="1d", candle_close_ts=None):
         row = {
             "id": id, "fired_at": fired_at, "symbol": symbol, "timeframe": timeframe,
             "direction": direction, "setup": setup, "entry_price": entry_price,
             "entry_level": entry_level, "fast_n": fast_n, "initial_risk_pct": initial_risk_pct,
-            "rsi_at_entry": rsi_at_entry, "status": "OPEN", "resolved_at": None,
+            "rsi_at_entry": rsi_at_entry, "candle_close_ts": candle_close_ts,
+            "status": "OPEN", "resolved_at": None,
             "resolved_price": None, "resolved_reason": None, "mfe_pct": 0.0, "mae_pct": 0.0,
             "r_multiple": None,
         }
@@ -79,9 +81,11 @@ class InMemoryStore:
                       resolved_reason=resolved_reason, mfe_pct=mfe_pct, mae_pct=mae_pct,
                       r_multiple=r_multiple)
 
-    async def get_open_signals(self, symbol=None):
+    async def get_open_signals(self, symbol=None, timeframe=None):
         return [dict(r) for r in self.rows.values()
-                if r["status"] == "OPEN" and (symbol is None or r["symbol"] == symbol)]
+                if r["status"] == "OPEN"
+                and (symbol is None or r["symbol"] == symbol)
+                and (timeframe is None or r["timeframe"] == timeframe)]
 
     async def get_signals_since(self, since):
         return sorted([dict(r) for r in self.rows.values() if r["fired_at"] >= since],
@@ -411,7 +415,7 @@ def test_performance_aggregation():
             resolved_price = 100.0 * (1 + r * 0.01) if direction == "LONG" else 100.0 * (1 - r * 0.01)
         return {
             "symbol": symbol, "setup": setup, "direction": direction, "status": status,
-            "entry_price": 100.0,
+            "timeframe": "1d", "entry_price": 100.0,
             "resolved_price": resolved_price,
             "r_multiple": r, "mfe_pct": mfe, "mae_pct": mae, "fired_at": now,
         }
@@ -437,6 +441,86 @@ def test_performance_aggregation():
     check("aggregate: worst signal is the -1.2R one", agg["worst_signal"]["r_multiple"] == -1.2)
 
 
+
+
+# ════════════════════════════════════════════════
+# 11. Таймфреймы изолированы друг от друга
+# ════════════════════════════════════════════════
+
+async def test_timeframe_isolation():
+    store = InMemoryStore()
+    h, l, c = flat(60)
+    sid_d = await tracker.record_signal(
+        symbol="TESTUSDT", direction="LONG", setup="breakout",
+        entry_price=101.0, entry_level=101.0, fast_n=config.DONCHIAN_LOOKBACK,
+        highs=h, lows=l, closes=c, timeframe="1d", candle_close_ts=1000, store=store,
+    )
+    sid_h = await tracker.record_signal(
+        symbol="TESTUSDT", direction="LONG", setup="breakout",
+        entry_price=101.0, entry_level=101.0, fast_n=config.DONCHIAN_LOOKBACK,
+        highs=h, lows=l, closes=c, timeframe="1h", candle_close_ts=2000, store=store,
+    )
+    check("одинаковый сетап на 1d и 1h — это ДВА разных сигнала", sid_d != sid_h)
+    check("в сторе две записи", len(store.rows) == 2, len(store.rows))
+
+    # Резолвим только часовой — дневной обязан остаться OPEN
+    h2, l2, c2 = extend_up(h, l, c, 40, start_high=101.0)
+    for i in range(1, 41):
+        await tracker.resolve_open_signals("TESTUSDT", h2[:60 + i], l2[:60 + i], c2[:60 + i],
+                                            timeframe="1h", store=store)
+        if store.rows[sid_h]["status"] != "OPEN":
+            break
+    check("часовой сигнал резолвится", store.rows[sid_h]["status"] == "WIN", store.rows[sid_h]["status"])
+    check("дневной сигнал НЕ тронут резолюцией часового", store.rows[sid_d]["status"] == "OPEN",
+          store.rows[sid_d]["status"])
+
+
+# ════════════════════════════════════════════════
+# 12. candle_close_ts сохраняется, дедуп учитывает таймфрейм
+# ════════════════════════════════════════════════
+
+async def test_candle_close_ts():
+    store = InMemoryStore()
+    h, l, c = flat(60)
+    sid = await tracker.record_signal(
+        symbol="TESTUSDT", direction="LONG", setup="breakout",
+        entry_price=101.0, entry_level=101.0, fast_n=config.DONCHIAN_LOOKBACK,
+        highs=h, lows=l, closes=c, timeframe="1h", candle_close_ts=1712345678000, store=store,
+    )
+    check("candle_close_ts сохранён", store.rows[sid]["candle_close_ts"] == 1712345678000)
+    check("timeframe сохранён", store.rows[sid]["timeframe"] == "1h")
+
+    dup = await tracker.record_signal(
+        symbol="TESTUSDT", direction="LONG", setup="breakout",
+        entry_price=101.5, entry_level=101.0, fast_n=config.DONCHIAN_LOOKBACK,
+        highs=h, lows=l, closes=c, timeframe="1h", candle_close_ts=1712349278000, store=store,
+    )
+    check("дедуп по уровню внутри одного TF работает", dup == sid, f"{dup} != {sid}")
+
+
+# ════════════════════════════════════════════════
+# 13. Разбивка по таймфреймам в статистике
+# ════════════════════════════════════════════════
+
+def test_timeframe_breakdown():
+    now = datetime.now(timezone.utc)
+
+    def rec(tf, status, r):
+        return {"symbol": "X", "setup": "breakout", "direction": "LONG", "status": status,
+                "timeframe": tf, "entry_price": 100.0,
+                "resolved_price": 100.0 * (1 + r * 0.01), "r_multiple": r,
+                "mfe_pct": 1.0, "mae_pct": -0.5, "fired_at": now}
+
+    agg = performance.aggregate([
+        rec("1d", "WIN", 2.0), rec("1d", "WIN", 1.0), rec("1d", "LOSS", -1.0),
+        rec("1h", "WIN", 1.0), rec("1h", "LOSS", -1.0),
+    ])
+    by_tf = agg["by_timeframe"]
+    check("by_timeframe содержит оба таймфрейма", set(by_tf) == {"1d", "1h"}, set(by_tf))
+    check("1d win rate 66.7%", abs(by_tf["1d"]["win_rate_pct"] - (2/3*100)) < 1e-9)
+    check("1h win rate 50%", abs(by_tf["1h"]["win_rate_pct"] - 50.0) < 1e-9)
+
+
 # ════════════════════════════════════════════════
 # Runner
 # ════════════════════════════════════════════════
@@ -451,8 +535,11 @@ async def main():
     await test_dedup()
     await test_restart_persistence()
     await test_no_lookahead()
+    await test_timeframe_isolation()
+    await test_candle_close_ts()
     test_rsi()
     test_performance_aggregation()
+    test_timeframe_breakdown()
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed\n")
     for name in PASS:

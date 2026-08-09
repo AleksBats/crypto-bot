@@ -2,6 +2,20 @@
 
 All notable changes to the Aster Intelligence Bot, in chronological order. Dates are approximate (from the working conversation, not git commit timestamps — see the GitHub repo's commit history at `github.com/AleksBats/crypto-bot/commits/main` for exact timestamps and hashes).
 
+## 2026-08-08 (Phase 3 — закрытые свечи, две цены, дедуп по свече, часовой контур)
+
+Реакция на реальный дефект, найденный пользователем на живом рынке: Failure Test по XRPUSDT показывал `1.046500` при рынке ~1.0481 и присылал одно и то же сообщение трижды за два часа. Разбор до кода показал три независимые причины — кэш свечей на 15 минут без запроса свежей цены перед отправкой, отсутствие дедупликации (cooldown ≠ дедуп) и участие незакрытой свечи в расчёте. Полный разбор в DECISIONS.md #13.
+
+- **Исправлено** отображение цены: теперь две отдельные строки — `Цена сигнала` (close закрытой свечи, по которой считались уровни) и `Текущая цена` (свежий запрос к Binance непосредственно перед отправкой) с процентом расхождения. При недоступности свежей цены честно пишется «н/д» вместо тихой подстановки устаревшей.
+- **Исправлены** повторные отправки: дедупликация по `(symbol, timeframe, setup, direction, candle_close_ts)` — одна свеча даёт максимум одно сообщение. Прежний cooldown был rate limiting'ом, а не дедупом.
+- **Изменено** время срабатывания: незакрытые свечи отбрасываются по фактическому `close_time`. По решению пользователя — для **всех трёх** индикаторов, не только Failure Test. Следствие: по 1D сигналов станет заметно меньше.
+- **Добавлен** параллельный часовой контур (1H) со своим кэшем и лимитом свечей. Дневной не изменился. Поле `timeframe` в статистике наконец различается — блок «Таймфреймы: N/A» в `/week` и `/stats` заменён реальной разбивкой 1D/1H.
+- **Добавлены** монеты ZECUSDT, SHIBUSDT, NEARUSDT, GRAMUSDT (итого 17 символов). Все проверены через Binance API до добавления: запрошенный пользователем `SHIBAUSDT` не существует, правильный тикер `SHIBUSDT` — иначе получили бы второй CAPUSDT. CAPUSDT оставлен по решению пользователя.
+- **Устранено** дублирование логики: три индикатора были скопированы в двух местах, при добавлении 1H стало бы четыре копии. Теперь единая `scan_technical(symbol, timeframe)`; `evaluate_signals()` отвечает только за volume/OI/funding.
+- **Схема БД:** колонка `candle_close_ts` через `ALTER TABLE ADD COLUMN IF NOT EXISTS` — существующие данные в Neon сохраняются. Резолюция OPEN-сигналов фильтруется по таймфрейму.
+- **Не тронуто:** `technical_signals.py` и `state.py` байт в байт, ни один торговый порог не изменён, в `config.py` только добавления.
+- **Тесты:** 54 проверки (было 44) — добавлены изоляция таймфреймов, сохранение `candle_close_ts`, разбивка по TF. Отдельно проверены отбрасывание незакрытой свечи и все ветки дедупа.
+
 ## 2026-08-08 (Phase 2 — signal performance statistics / paper trading)
 
 Full spec-driven build: persistent WIN/LOSS/OPEN tracking with R-multiples, MFE/MAE, RSI context, combo-setup detection, and on-demand Telegram reports — superseding the first prototype from earlier the same day. Went through an explicit Phase 1 (architecture analysis + plan, no code) and a Telegram-preview approval step before any file was touched, per the user's process requirement.

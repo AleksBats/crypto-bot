@@ -119,11 +119,22 @@ def _symbols_block(agg: dict) -> list[str]:
     return lines
 
 
-def _timeframe_note() -> list[str]:
-    # Deliberately no TF leaderboard — see DECISIONS.md #12. Kept as an
-    # explicit, explained N/A rather than silently omitted, per the user's
-    # instruction not to hide unavailable metrics.
-    return ["", "⏱ Таймфреймы: N/A — бот сейчас торгует только 1D"]
+TF_LABELS = {"1d": "1D", "1h": "1H"}
+
+
+def _timeframe_block(agg: dict) -> list[str]:
+    """Реальная разбивка по таймфреймам. До появления часового контура здесь
+    стояло честное N/A, потому что все сигналы были дневными — теперь данные
+    действительно различаются. См. DECISIONS.md #13."""
+    lines = ["", "⏱ <b>ТАЙМФРЕЙМЫ</b>"]
+    by_tf = agg.get("by_timeframe") or {}
+    if not by_tf:
+        lines.append("N/A — пока нет закрытых сигналов")
+        return lines
+    for tf, s in sorted(by_tf.items(), key=lambda kv: -kv[1]["win_rate_pct"]):
+        label = TF_LABELS.get(tf, tf)
+        lines.append(f"{label} — {s['signals']} сигналов, {_wr(s['win_rate_pct'])} WR")
+    return lines
 
 
 def _assemble(header: str, period_line: str, agg: dict) -> str:
@@ -133,7 +144,7 @@ def _assemble(header: str, period_line: str, agg: dict) -> str:
     lines += _performance_block(agg)
     lines += _setups_block(agg)
     lines += _symbols_block(agg)
-    lines += _timeframe_note()
+    lines += _timeframe_block(agg)
     return "\n".join(lines)
 
 

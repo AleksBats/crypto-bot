@@ -14,11 +14,17 @@ Open items, roughly in priority order. Nothing here is urgent — the bot is liv
 - [ ] **No automatic weekly report yet — by explicit instruction.** `signal_stats/reports.build_week_report()` is implemented and tested; wiring it to fire automatically every 7 days (e.g. via a periodic check in `run_live.py`'s loop, or an external Render Cron Job hitting a new endpoint) was deliberately deferred. Come back to this once `/week` has been used on demand for a bit.
 - [ ] Decide on a policy for what counts as "signal performance" once the bot has been redeployed many times — since `fired_at` timestamps persist in Neon across redeploys (unlike the old JSON-file approach), `/stats` will keep accumulating correctly, but it's worth confirming with the user whether very old signals (e.g. from before a future indicator-logic change) should ever be excluded from `/stats`. Not an issue yet — there's no history.
 - [ ] Consider exposing win-rate stats on the health-check HTTP endpoint (currently just returns `{"status": "alive"}`) so they're checkable without needing to send a Telegram command.
-- [ ] `signal_stats/` has no `pytest`-based suite — `test_statistics.py` is a plain asyncio script (44 checks) in the same "synthetic testing before shipping" style as the rest of this project (see DECISIONS.md #2). Fine as-is, but if the project ever adopts `pytest` properly, this is the first candidate to convert.
+- [ ] `signal_stats/` has no `pytest`-based suite — `test_statistics.py` is a plain asyncio script (54 checks) in the same "synthetic testing before shipping" style as the rest of this project (see DECISIONS.md #2). Fine as-is, but if the project ever adopts `pytest` properly, this is the first candidate to convert.
 
 ## Superseded (first prototype, kept for history — see DECISIONS.md #12)
 
 - [x] ~~`signals_log.json` is not on persistent storage~~ — resolved by moving to Neon Postgres in Phase 2. The Phase 1 JSON-file prototype never reached this repository at all; the `signal_stats/` package is the only implementation here.
+
+## Phase 3 (закрытые свечи / 1H / дедуп) — что осталось
+
+- [ ] Понаблюдать сутки-двое: по 1D сигналов теперь заметно меньше (ждём закрытия дня), по 1H — новый поток. Убедиться, что объём сообщений комфортный; если 1H слишком шумный, его можно выключить одной переменной `ENABLE_HOURLY_SIGNALS=false` без правки кода.
+- [ ] Дедуп по свече живёт в памяти процесса — после рестарта Render возможна одна повторная отправка на свечу. Если это будет мешать, перенести в Neon (колонка `candle_close_ts` уже есть). Пока сознательно не сделано: дедуп не должен зависеть от наличия БД.
+- [ ] `CAPUSDT` по-прежнему в списке по вашему решению и по-прежнему 400-ит на каждом цикле. Теперь запросов вдвое больше (1D + 1H), то есть и warning'ов вдвое. Решить окончательно.
 
 ## Cleanup
 

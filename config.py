@@ -54,6 +54,16 @@ FAILURE_TEST_LOOKBACK = int(os.environ.get("FAILURE_TEST_LOOKBACK", "5"))   # б
 DAILY_KLINES_LIMIT    = int(os.environ.get("DAILY_KLINES_LIMIT",    "90"))  # дневных свечей на загрузку
 POLL_TECHNICAL_SECS   = int(os.environ.get("POLL_TECHNICAL_SECS",   "900")) # 15 мин — дневные данные не нужно чаще
 
+# ── Часовой (1H) контур технических сигналов ─────────────────────────────────
+# Те же три индикатора считаются ПАРАЛЛЕЛЬНО на часовых свечах. Дневной контур
+# при этом не меняется — это отдельный, независимый набор сигналов, помеченный
+# таймфреймом "1h". См. DECISIONS.md #13.
+ENABLE_HOURLY_SIGNALS = os.environ.get("ENABLE_HOURLY_SIGNALS", "true").lower() in ("1", "true", "yes")
+HOURLY_KLINES_LIMIT   = int(os.environ.get("HOURLY_KLINES_LIMIT", "200"))  # часовых свечей на загрузку
+# Кэш часовых свечей короче дневного: часовая свеча закрывается каждый час,
+# и 15-минутный кэш задерживал бы обнаружение новой закрытой свечи.
+POLL_HOURLY_SECS      = int(os.environ.get("POLL_HOURLY_SECS", "300"))     # 5 мин
+
 # Список монет, по которым Breakout / Turtle Zone Filter / Failure Test
 # сканируются ОТДЕЛЬНО от основного SYMBOL_SPOT (ASTERUSDT). Для этих монет
 # шлются только сигналы этих трёх индикаторов — без volume/OI/funding.
@@ -62,7 +72,8 @@ TECHNICAL_SYMBOLS = [
     for s in os.environ.get(
         "TECHNICAL_SYMBOLS",
         "SOLUSDT,LINKUSDT,ETHUSDT,BTCUSDT,XRPUSDT,XLMUSDT,HYPERUSDT,"
-        "ADAUSDT,DOGEUSDT,PEPEUSDT,PENGUUSDT,CAPUSDT",
+        "ADAUSDT,DOGEUSDT,PEPEUSDT,PENGUUSDT,CAPUSDT,"
+        "ZECUSDT,SHIBUSDT,NEARUSDT,GRAMUSDT",
     ).split(",")
     if s.strip()
 ]

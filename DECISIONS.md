@@ -144,3 +144,33 @@ Non-obvious technical decisions and the bugs/investigations that motivated them.
 **No automatic weekly report yet — by explicit instruction:** `signal_stats/reports.build_week_report()` is fully implemented and tested, but nothing calls it on a schedule. The user asked to implement and test the reporting function first and defer wiring up automatic delivery. `/week` on demand works today; a scheduled push is a follow-up, not done here.
 
 **Testing without a live Postgres:** this sandbox has no path to provision real Postgres (no root, `apt-get download` blocked by the network egress allowlist — `403` from the proxy — and no embeddable-Postgres Python package available). `signal_store.py`'s SQL was written and hand-reviewed for correctness (idempotent `CREATE TABLE/INDEX IF NOT EXISTS`, parameterized queries) but never executed against a live database. All business logic (`signal_tracker.py`, `performance.py`, `reports.py` — dedup, WIN/LOSS/OPEN resolution, no-look-ahead, weekly/monthly date filtering, restart/persistence semantics) was verified with a real in-memory store that implements the exact same async interface as `signal_store.py` (see `test_statistics.py`) — 44 checks, all passing. **Do a manual smoke test against the real Neon instance once `DATABASE_URL` is set on Render** — see TODO.md.
+
+---
+
+### 13. Failure Test показывал устаревшую цену и слал дубли — 1H контур, закрытые свечи, две цены
+
+**Найдено пользователем на живом рынке, подтверждено логами и кодом.** В Telegram по XRPUSDT приходило `Текущая цена: 1.046500`, тогда как на TradingView рынок был около 1.0481. Причём одно и то же сообщение с той же ценой пришло трижды: 16:50, 18:05, 18:40.
+
+**Причина №1 — кэш.** `detect_failure_test()` возвращал `price = closes[-1]`, а `closes` приходил из `fetch_daily()`, который кэшировал ответ Binance на `POLL_TECHNICAL_SECS` (900 с). Основной цикл идёт каждые 300 с, то есть два цикла из трёх работали на данных возрастом до 15 минут. Перед отправкой в Telegram свежая цена не запрашивалась вообще. Расхождение 0.15% для XRP за 15 минут — нормальная рыночная динамика, а не сбой математики.
+
+**Причина №2 — не было дедупликации.** `alert_engine._is_on_cooldown()` — это rate limiting («не чаще раза в 30 минут»), а не «одно событие — одно сообщение». Условие Failure Test считается на дневных свечах с окном `lookback=5` и остаётся истинным сутками; каждые 30 минут по истечении cooldown то же самое состояние уходило заново. Интервалы 16:50 → 18:05 → 18:40 это ровно подтверждают. Дедуп в слое статистики (`find_open_duplicate`) существовал, но гейтил только запись в БД, не отправку.
+
+**Причина №3 — незакрытая свеча.** Binance возвращает последним элементом текущую формирующуюся свечу, и она попадала в детекторы. Сигнал мог объявиться в середине дня и затем «передумать».
+
+**Исправления (математика детекторов в `technical_signals.py` не тронута, файл байт в байт):**
+
+- `fetch_klines()` заменил `fetch_daily()`: универсален по таймфрейму, возвращает `close_times` и **отбрасывает незакрытые свечи по фактическому `close_time`**, а не «срезает последнюю вслепую». По решению пользователя правило применено ко **всем трём** индикаторам, а не только к Failure Test — иначе поведение разъезжается.
+- `fetch_current_price()` — отдельный лёгкий запрос `ticker/price` непосредственно перед отправкой, и **только** после того, как дедуп пропустил сигнал (иначе летели бы лишние запросы каждую итерацию). При ошибке возвращает `None`, и в сообщении честно пишется «н/д» вместо тихой подстановки старой цены.
+- Форматтеры показывают **две отдельные цены**: `Цена сигнала` (close закрытой свечи, по которой считались уровни — неизменна) и `Текущая цена` (рынок на момент отправки) с процентом расхождения.
+- `_is_new_candle_signal()` — дедуп по ключу `(symbol, timeframe, setup, direction)` со значением `close_time` свечи. Одна свеча — максимум одно сообщение. **Компромисс:** состояние в памяти процесса, после рестарта Render возможна одна повторная отправка на свечу. Сделано осознанно: иначе дедуп зависел бы от наличия БД, а бот обязан работать и без `DATABASE_URL`.
+
+**Часовой контур (1H) параллельно дневному.** Пользователь исходно считал, что Failure Test работает на 1H — на самом деле бот использовал только `interval="1d"`. По его решению добавлен независимый часовой контур: свой кэш (`POLL_HOURLY_SECS=300`, короче дневного, потому что часовая свеча закрывается каждый час), свой лимит свечей, сигналы помечены таймфреймом. Побочный эффект: поле `timeframe` в статистике наконец различается, и блок «Таймфреймы: N/A» в отчётах заменён реальной разбивкой 1D/1H (см. #12, где N/A был честной заглушкой).
+
+**Устранено дублирование.** Логика трёх индикаторов была скопирована в `evaluate_signals()` и `scan_technical_symbols()`; при добавлении 1H стало бы четыре копии. Теперь единая `scan_technical(symbol, timeframe)` + `scan_all_technical()`. `evaluate_signals()` отвечает только за volume/OI/funding.
+
+**Схема БД:** добавлена колонка `candle_close_ts BIGINT` через `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` — существующие строки в Neon сохраняются с `NULL`. Резолюция OPEN-сигналов теперь фильтруется по таймфрейму: дневной сигнал нельзя закрывать по часовым уровням Дончиана и наоборот.
+
+**Добавлены монеты:** ZECUSDT, SHIBUSDT, NEARUSDT, GRAMUSDT. Все четыре проверены запросом к Binance API **до** добавления. Пользователь просил `SHIBAUSDT` — такого тикера не существует (`{"code":-1121,"msg":"Invalid symbol."}`), правильный `SHIBUSDT`; добавление как есть дало бы второй CAPUSDT. CAPUSDT оставлен по явному решению пользователя.
+
+**Последствие, о котором предупреждён пользователь:** по 1D сигналов станет заметно меньше — теперь ждём закрытия дня. Тишина в первые сутки после деплоя ожидаема и не является сбоем.
+

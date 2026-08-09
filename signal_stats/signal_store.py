@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS signals (
     entry_price     DOUBLE PRECISION NOT NULL,
     entry_level     DOUBLE PRECISION NOT NULL,
     fast_n          INTEGER NOT NULL,
+    candle_close_ts BIGINT,                      -- close_time свечи-источника (мс), для дедупа по свече
     initial_risk_pct DOUBLE PRECISION NOT NULL, -- |entry - invalidation band| / entry * 100, frozen at entry, for R multiples
     rsi_at_entry    DOUBLE PRECISION,
     status          TEXT NOT NULL DEFAULT 'OPEN', -- OPEN | WIN | LOSS
@@ -64,6 +65,10 @@ CREATE INDEX IF NOT EXISTS idx_signals_fired_at ON signals (fired_at);
 CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals (symbol);
 CREATE INDEX IF NOT EXISTS idx_signals_open_dedup ON signals (symbol, direction, setup, entry_level)
     WHERE status = 'OPEN';
+CREATE INDEX IF NOT EXISTS idx_signals_timeframe ON signals (timeframe);
+-- Миграция для БД, созданных до появления часового контура: колонка
+-- добавляется идемпотентно, существующие строки остаются с NULL.
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS candle_close_ts BIGINT;
 """
 
 
@@ -96,16 +101,17 @@ def _row_to_dict(row) -> dict:
 
 # ── writes ───────────────────────────────────────────────────────────────────
 
-async def find_open_duplicate(symbol: str, setup: str, direction: str, entry_level: float) -> Optional[dict]:
+async def find_open_duplicate(symbol: str, setup: str, direction: str, entry_level: float,
+                               timeframe: str = "1d") -> Optional[dict]:
     pool = await get_pool()
     if pool is None:
         return None
     row = await pool.fetchrow(
         """SELECT * FROM signals
            WHERE status = 'OPEN' AND symbol = $1 AND setup = $2
-             AND direction = $3 AND entry_level = $4
+             AND direction = $3 AND entry_level = $4 AND timeframe = $5
            LIMIT 1""",
-        symbol, setup, direction, entry_level,
+        symbol, setup, direction, entry_level, timeframe,
     )
     return _row_to_dict(row)
 
@@ -114,6 +120,7 @@ async def insert_signal(
     id: str, fired_at: datetime, symbol: str, direction: str, setup: str,
     entry_price: float, entry_level: float, fast_n: int, initial_risk_pct: float,
     rsi_at_entry: Optional[float], timeframe: str = "1d",
+    candle_close_ts: Optional[int] = None,
 ) -> Optional[dict]:
     pool = await get_pool()
     if pool is None:
@@ -122,12 +129,14 @@ async def insert_signal(
     row = await pool.fetchrow(
         """INSERT INTO signals
              (id, fired_at, symbol, timeframe, direction, setup,
-              entry_price, entry_level, fast_n, initial_risk_pct, rsi_at_entry)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+              entry_price, entry_level, fast_n, initial_risk_pct, rsi_at_entry,
+              candle_close_ts)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
            ON CONFLICT (id) DO NOTHING
            RETURNING *""",
         id, fired_at, symbol, timeframe, direction, setup,
         entry_price, entry_level, fast_n, initial_risk_pct, rsi_at_entry,
+        candle_close_ts,
     )
     return _row_to_dict(row)
 
@@ -162,11 +171,16 @@ async def resolve_signal(
 
 # ── reads ────────────────────────────────────────────────────────────────────
 
-async def get_open_signals(symbol: Optional[str] = None) -> list[dict]:
+async def get_open_signals(symbol: Optional[str] = None,
+                            timeframe: Optional[str] = None) -> list[dict]:
     pool = await get_pool()
     if pool is None:
         return []
-    if symbol:
+    if symbol and timeframe:
+        rows = await pool.fetch(
+            "SELECT * FROM signals WHERE status = 'OPEN' AND symbol = $1 AND timeframe = $2",
+            symbol, timeframe)
+    elif symbol:
         rows = await pool.fetch("SELECT * FROM signals WHERE status = 'OPEN' AND symbol = $1", symbol)
     else:
         rows = await pool.fetch("SELECT * FROM signals WHERE status = 'OPEN'")

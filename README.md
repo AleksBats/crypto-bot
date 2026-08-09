@@ -10,8 +10,10 @@ A 24/7 Python bot that polls Binance's free public REST API and sends Telegram a
 - Extreme funding rate
 - Breakout / Turtle Zone Filter / Failure Test (see below)
 
-**12 additional coins, technical signals only** (SOL, LINK, ETH, BTC, XRP, XLM, HYPER, ADA, DOGE, PEPE, PENGU, CAP — all vs USDT, configurable via `TECHNICAL_SYMBOLS`):
+**16 additional coins, technical signals only** (SOL, LINK, ETH, BTC, XRP, XLM, HYPER, ADA, DOGE, PEPE, PENGU, CAP, ZEC, SHIB, NEAR, GRAM — all vs USDT, configurable via `TECHNICAL_SYMBOLS`):
 - Breakout, Turtle Zone Filter, Failure Test only — no volume/OI/funding noise for these.
+
+**Two timeframes in parallel — 1D and 1H**, computed on **closed candles only**. A signal can never appear mid-candle and then change its mind. Alerts show two separate prices: the close of the candle that created the signal, and a fresh market price fetched right before sending. The same signal is never re-sent for the same candle. See DECISIONS.md #13.
 
 All three technical indicators are standard Donchian-channel implementations (not exact copies of any TradingView Pine script — see CLAUDE.md/DECISIONS.md).
 
@@ -36,7 +38,7 @@ Check it in Telegram any time:
 
 No automatic weekly push yet — implemented and tested, not scheduled (deliberately deferred, see TODO.md).
 
-**Caveats, shown honestly rather than faked:** timeframe is always `1D` (the bot only trades daily candles — no 4H/15m breakdown exists); volume isn't tracked for the 12 technical-only symbols (not fetched there). Both render as explicit `N/A` in reports instead of invented numbers.
+**Timeframe breakdown is real** now that 1D and 1H run in parallel — `/week` and `/stats` show genuine 1D-vs-1H win rates. Volume still isn't tracked for the technical-only symbols (not fetched there) and renders as an explicit `N/A` rather than an invented number.
 
 **Storage:** Neon Postgres (free tier) via `DATABASE_URL` — chosen because Render's free tier has no persistent disk and Render's own free Postgres expires after 30 days. If `DATABASE_URL` isn't set, the bot runs completely normally (alerts, indicators, everything) with statistics silently disabled — see `signal_stats/signal_store.py`.
 
@@ -55,7 +57,7 @@ No automatic weekly push yet — implemented and tested, not scheduled (delibera
 | `signal_stats/performance.py` | Pure aggregation: win rate, R, MFE/MAE, Profit Factor, breakdowns. |
 | `signal_stats/reports.py` | Builds the `/today /week /month /stats` Telegram messages. |
 | `signal_stats/telegram_commands.py` | Long-polls Telegram for incoming commands. |
-| `test_statistics.py` | Synthetic tests for the whole statistics package (44 checks, in-memory store). |
+| `test_statistics.py` | Synthetic tests for the whole statistics package (54 checks, in-memory store). |
 | `requirements.txt` | Python dependencies (`httpx`, `python-dotenv`, `asyncpg`). |
 
 ## Running locally
@@ -93,6 +95,7 @@ Every signal type has a 30-minute cooldown per symbol (`ALERT_COOLDOWN_SECS`, `a
 ## Known limitations
 
 - `CAPUSDT` doesn't exist on Binance Spot — it's in `TECHNICAL_SYMBOLS` by user request but every request for it 400s and is skipped with a log warning.
+- Signal deduplication (one message per candle) lives in process memory, so a Render restart can allow one repeat per candle. Deliberate — see DECISIONS.md #13.
 - Whale on-chain tracking and Twitter/X monitoring are configured in `config.py` but not wired into `run_live.py` — see CLAUDE.md.
 - `signal_stats/signal_store.py` has been reviewed but never executed against a live Postgres connection (sandbox limitation, not a code gap) — see TODO.md for the smoke test to run once `DATABASE_URL` is live.
 - No automatic weekly report yet — `/week` works on demand; scheduled delivery is a deliberate follow-up.

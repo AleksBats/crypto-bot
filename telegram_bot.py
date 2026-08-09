@@ -4,6 +4,8 @@ Verified endpoint: https://api.telegram.org/bot{TOKEN}/sendMessage
 """
 
 import logging
+from typing import Optional
+
 import httpx
 import config
 
@@ -100,37 +102,106 @@ def fmt_combo_alert(signals: list[str]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-#  Новые форматтеры для Breakout / Turtle Zone Filter / Failure Test
+#  Форматтеры Breakout / Turtle Zone Filter / Failure Test
+#
+#  ВАЖНО — две РАЗНЫЕ цены, не путать (см. DECISIONS.md #13):
+#    signal_price  — close СВЕЧИ, создавшей сигнал (закрытой!). Именно по ней
+#                    считались уровни Дончиана, она неизменна навсегда.
+#    current_price — свежая рыночная цена, запрошенная у Binance
+#                    непосредственно перед отправкой сообщения. Может
+#                    отличаться от signal_price — это нормально и ожидаемо.
+#  Раньше показывалась одна цена — закэшированный close (до 15 мин давности),
+#  что выглядело как расхождение с TradingView. Теперь обе видны явно.
 # ─────────────────────────────────────────────────────────────
-def fmt_breakout_alert(symbol: str, direction: str, level: float, price: float, n: int) -> str:
+
+def _tf_label(timeframe: str) -> str:
+    return {"1d": "1D (дневной)", "1h": "1H (часовой)"}.get(timeframe, timeframe)
+
+
+def _price_block(signal_price: float, current_price: Optional[float]) -> str:
+    """Две цены + расхождение между ними. Если свежую цену получить не
+    удалось (сеть/лимиты), показываем это честно, а не молча подставляем
+    цену сигнала."""
+    lines = [f"Цена сигнала: <b>${signal_price:.6f}</b>"]
+    if current_price is None:
+        lines.append("Текущая цена: <i>н/д (не удалось запросить)</i>")
+    else:
+        delta_pct = (current_price - signal_price) / signal_price * 100 if signal_price else 0.0
+        lines.append(f"Текущая цена: <b>${current_price:.6f}</b> ({delta_pct:+.2f}%)")
+    return "\n".join(lines)
+
+
+def fmt_breakout_alert(symbol: str, direction: str, level: float, signal_price: float,
+                        n: int, timeframe: str = "1d", current_price: Optional[float] = None) -> str:
     emoji = "🚀" if direction == "bullish" else "🔻"
     label = "BREAKOUT LONG" if direction == "bullish" else "BREAKOUT SHORT"
     return (
         f"{emoji} <b>{label}</b> — <b>{symbol}</b>\n"
-        f"Канал: {n}-дневной Donchian\n"
+        f"Таймфрейм: {_tf_label(timeframe)}\n"
+        f"Канал: {n}-периодный Donchian\n"
         f"Уровень пробоя: ${level:.6f}\n"
-        f"Цена: <b>${price:.6f}</b>"
+        f"{_price_block(signal_price, current_price)}"
     )
 
 
-def fmt_turtle_zone_alert(symbol: str, direction: str, stage: str, fast_level: float, slow_level: float, price: float) -> str:
+def fmt_turtle_zone_alert(symbol: str, direction: str, stage: str, fast_level: float,
+                           slow_level: float, signal_price: float, timeframe: str = "1d",
+                           current_price: Optional[float] = None) -> str:
     emoji = "🐢🚀" if direction == "bullish" else "🐢🔻"
     label = "TURTLE ZONE LONG" if direction == "bullish" else "TURTLE ZONE SHORT"
-    stage_ru = "подтверждено (пробит и 55-дневный канал)" if stage == "confirmed" else "ранняя зона (пробит только 20-дневный канал)"
+    stage_ru = ("подтверждено (пробит и медленный канал)" if stage == "confirmed"
+                else "ранняя зона (пробит только быстрый канал)")
     return (
         f"{emoji} <b>{label}</b> — <b>{symbol}</b>\n"
+        f"Таймфрейм: {_tf_label(timeframe)}\n"
         f"Стадия: {stage_ru}\n"
-        f"Fast (20d): ${fast_level:.6f}\n"
-        f"Slow (55d): ${slow_level:.6f}\n"
-        f"Цена: <b>${price:.6f}</b>"
+        f"Fast: ${fast_level:.6f}\n"
+        f"Slow: ${slow_level:.6f}\n"
+        f"{_price_block(signal_price, current_price)}"
     )
 
 
-def fmt_failure_test_alert(symbol: str, direction: str, level: float, price: float) -> str:
+def fmt_failure_test_alert(symbol: str, direction: str, level: float, signal_price: float,
+                            timeframe: str = "1d", current_price: Optional[float] = None) -> str:
     emoji = "⚠️🔻" if direction == "SHORT" else "⚠️🚀"
     return (
         f"{emoji} <b>FAILURE TEST {direction}</b> — <b>{symbol}</b>\n"
+        f"Таймфрейм: {_tf_label(timeframe)}\n"
         f"Ложный пробой уровня ${level:.6f}\n"
-        f"Текущая цена: <b>${price:.6f}</b>\n"
+        f"{_price_block(signal_price, current_price)}\n"
         f"<i>Цена не удержала пробой — вероятность разворота</i>"
     )
+
+
+# ─────────────────────────────────────────────────────────────
+#  DEPRECATED — first-prototype signal accuracy report (see top-level
+#  signal_tracker.py). Superseded by statistics/reports.py, which builds
+#  the /stats /week /today /month messages directly. Not called by
+#  run_live.py anymore. Kept only for history — see DECISIONS.md #12.
+# ─────────────────────────────────────────────────────────────
+def fmt_stats_summary(overall: dict, by_type: dict) -> str:
+    def _wr(s: dict) -> str:
+        return f"{s['win_rate_pct']:.1f}%" if s["win_rate_pct"] is not None else "n/a"
+
+    lines = ["📊 <b>Signal Accuracy Report</b>", ""]
+    lines.append(
+        f"Overall: <b>{overall['wins']}W / {overall['losses']}L</b> "
+        f"({_wr(overall)}) — {overall['pending']} pending"
+    )
+    lines.append("")
+
+    labels = {"breakout": "Breakout", "turtle_zone": "Turtle Zone", "failure_test": "Failure Test"}
+    for sig_type, s in by_type.items():
+        if s["total"] == 0:
+            continue
+        label = labels.get(sig_type, sig_type.replace("_", " ").title())
+        lines.append(f"<b>{label}</b>: {s['wins']}W / {s['losses']}L ({_wr(s)}) — {s['pending']} pending")
+
+    lines.append("")
+    lines.append(
+        "<i>WIN = price closed beyond the 55-day slow band in the predicted "
+        "direction before closing past the fast-band/level invalidation. "
+        "LOSS = the reverse. Pending signals aren't counted yet. "
+        "See DECISIONS.md #11.</i>"
+    )
+    return "\n".join(lines)
