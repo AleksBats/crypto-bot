@@ -10,7 +10,7 @@ A 24/7 Python bot that polls Binance's free public REST API and sends Telegram a
 - Extreme funding rate
 - Breakout / Turtle Zone Filter / Failure Test (see below)
 
-**16 additional coins, technical signals only** (SOL, LINK, ETH, BTC, XRP, XLM, HYPER, ADA, DOGE, PEPE, PENGU, CAP, ZEC, SHIB, NEAR, GRAM — all vs USDT, configurable via `TECHNICAL_SYMBOLS`):
+**15 additional coins, technical signals only** (SOL, LINK, ETH, BTC, XRP, XLM, HYPER, ADA, DOGE, PEPE, PENGU, ZEC, SHIB, NEAR, GRAM — all vs USDT, configurable via `TECHNICAL_SYMBOLS`):
 - Breakout, Turtle Zone Filter, Failure Test only — no volume/OI/funding noise for these.
 
 **Two timeframes in parallel — 1D and 1H**, computed on **closed candles only**. A signal can never appear mid-candle and then change its mind. Alerts show two separate prices: the close of the candle that created the signal, and a fresh market price fetched right before sending. The same signal is never re-sent for the same candle. See DECISIONS.md #13.
@@ -99,7 +99,6 @@ Every signal type has a 30-minute cooldown per symbol (`ALERT_COOLDOWN_SECS`, `a
 
 ## Known limitations
 
-- `CAPUSDT` doesn't exist on Binance Spot — it's in `TECHNICAL_SYMBOLS` by user request but every request for it 400s and is skipped with a log warning.
 - Signal deduplication (one message per candle) lives in process memory, so a Render restart can allow one repeat per candle. Deliberate — see DECISIONS.md #13.
 - Whale on-chain tracking and Twitter/X monitoring are configured in `config.py` but not wired into `run_live.py` — see CLAUDE.md.
 - `signal_stats/signal_store.py` has been reviewed but never executed against a live Postgres connection (sandbox limitation, not a code gap) — see TODO.md for the smoke test to run once `DATABASE_URL` is live.

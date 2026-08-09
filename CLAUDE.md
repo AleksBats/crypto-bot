@@ -20,12 +20,12 @@ Instructions for any Claude session working in this project folder.
 
 ## What this project is
 
-**Aster Intelligence Bot** — a 24/7 Python bot that polls Binance's free public REST API and pushes Telegram alerts when trading signals fire. Originally built to monitor the ASTER token; now also scans 16 additional coins for three technical-pattern indicators on two timeframes, tracks whether those signals actually worked, and answers `/stats /week /today /month` on demand in Telegram.
+**Aster Intelligence Bot** — a 24/7 Python bot that polls Binance's free public REST API and pushes Telegram alerts when trading signals fire. Originally built to monitor the ASTER token; now also scans 15 additional coins for three technical-pattern indicators on two timeframes, tracks whether those signals actually worked, and answers `/stats /week /today /month` on demand in Telegram.
 
 Two signal families:
 
 - **ASTER-only** (`SYMBOL_SPOT` / `SYMBOL_FUTURES`, default `ASTERUSDT`): volume spikes, open-interest changes, extreme funding rate, plus all three technical indicators below.
-- **Technical-only, multi-symbol** (`config.TECHNICAL_SYMBOLS`, 16 coins by default: SOL, LINK, ETH, BTC, XRP, XLM, HYPER, ADA, DOGE, PEPE, PENGU, CAP, ZEC, SHIB, NEAR, GRAM — all vs USDT): only the three technical indicators, no volume/OI/funding noise.
+- **Technical-only, multi-symbol** (`config.TECHNICAL_SYMBOLS`, 15 coins by default: SOL, LINK, ETH, BTC, XRP, XLM, HYPER, ADA, DOGE, PEPE, PENGU, ZEC, SHIB, NEAR, GRAM — all vs USDT): only the three technical indicators, no volume/OI/funding noise.
 
 **4H контекст (Phase 4):** `trend_context.py` считает структуру рынка и тренд по 4H и 1D для каждого сигнала — чистая информация, на отправку не влияет. Swing-точки подтверждаются только после закрытия `SWING_LOOKBACK` свечей справа (по умолчанию 2), поэтому look-ahead невозможен, а трендовая линия не перерисовывается. `trendline.pine` повторяет ту же формулу в TradingView.
 
@@ -90,7 +90,7 @@ Answers two things: "did our indicators actually predict direction correctly?" (
 - `price.py`, `whale.py`, `funding.py`, `open_interest.py`, `volume.py`, `twitter.py` exist in the GitHub repo's history as earlier/alternative monitor stubs. **None of them are imported by `run_live.py`** — they're dead code as far as the live bot is concerned. Don't assume they run.
 - Whale on-chain tracking (`ASTER_CONTRACT_ADDRESS` etc. in `config.py`) is loaded but never used — the contract address was never confirmed.
 - Twitter/X monitoring (`TWITTER_BEARER_TOKEN`, `TWITTER_WATCH_ACCOUNTS` in `config.py`) is loaded but never used.
-- `CAPUSDT` (one of the 12 technical-only symbols) does not exist on Binance Spot as of this writing — it 400s on every request and is skipped with a warning log. The user asked to keep it in the list regardless; do not silently remove it without asking.
+- `CAPUSDT` was removed from `TECHNICAL_SYMBOLS` on the user's explicit instruction after it 400'd twice per cycle (1D + 1H). It never existed on Binance Spot. Do not re-add it. See DECISIONS.md #10.
 - `signal_stats/signal_store.py` has never run against a live Postgres connection (sandbox couldn't provision one) — see TODO.md for the smoke test to run once deployed.
 
 ## If you're asked to add a new signal or symbol

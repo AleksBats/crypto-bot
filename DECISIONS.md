@@ -93,7 +93,9 @@ Non-obvious technical decisions and the bugs/investigations that motivated them.
 
 ### 10. `CAPUSDT` does not exist on Binance Spot
 
-**Found via production logs:** every `klines` request for `CAPUSDT` returns `400 Bad Request`. The user was informed and explicitly chose to keep it in `TECHNICAL_SYMBOLS` anyway rather than remove or substitute it. `scan_technical_symbols()` already handles this gracefully — it logs a warning and continues to the next symbol, it does not crash or block the other 11 coins.
+**Found via production logs:** every `klines` request for `CAPUSDT` returns `400 Bad Request`. The user was informed and initially chose to keep it in `TECHNICAL_SYMBOLS` rather than remove or substitute it. The scan handled it gracefully — logged a warning and continued to the next symbol, never crashing or blocking the other coins.
+
+**РЕЗОЛЮЦИЯ (2026-08-09):** удалён из списка по явному указанию пользователя. Поводом стало то, что после добавления часового контура (#13) он начал возвращать 400 **дважды за цикл** вместо одного раза — на 1D и на 1H. Ценности он не нёс никогда, а шума в логах стало вдвое больше. Не возвращать без явного запроса.
 
 ---
 

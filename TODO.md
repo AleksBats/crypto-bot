@@ -4,7 +4,7 @@ Open items, roughly in priority order. Nothing here is urgent — the bot is liv
 
 ## Verification
 
-- [ ] Confirm at least one real (non-startup) Telegram alert has actually fired for one of the three technical indicators, on either ASTERUSDT or one of the 12 technical-only coins. As of this consolidation, only startup/shutdown messages have been confirmed delivered — the detection logic has been verified with synthetic data, not yet observed firing on live market data.
+- [x] ~~Подтвердить, что реальный (не стартовый) сигнал доходит до Telegram~~ — подтверждено 2026-08-09 на живых данных: FAILURE TEST по ADAUSDT, DOGEUSDT, SHIBUSDT, GRAMUSDT и BREAKOUT по GRAMUSDT.
 - [ ] Let the bot run for a few days and confirm the UptimeRobot keep-alive is holding (check Render's Events log for absence of unexplained `SIGTERM` entries).
 - [ ] Let `signal_stats/` accumulate at least a handful of resolved (WIN/LOSS) signals on live data and sanity-check a few by hand against a chart before trusting the win-rate percentage for decisions.
 
@@ -24,7 +24,6 @@ Open items, roughly in priority order. Nothing here is urgent — the bot is liv
 
 - [ ] Понаблюдать сутки-двое: по 1D сигналов теперь заметно меньше (ждём закрытия дня), по 1H — новый поток. Убедиться, что объём сообщений комфортный; если 1H слишком шумный, его можно выключить одной переменной `ENABLE_HOURLY_SIGNALS=false` без правки кода.
 - [ ] Дедуп по свече живёт в памяти процесса — после рестарта Render возможна одна повторная отправка на свечу. Если это будет мешать, перенести в Neon (колонка `candle_close_ts` уже есть). Пока сознательно не сделано: дедуп не должен зависеть от наличия БД.
-- [ ] `CAPUSDT` по-прежнему в списке по вашему решению и по-прежнему 400-ит на каждом цикле. Теперь запросов вдвое больше (1D + 1H), то есть и warning'ов вдвое. Решить окончательно.
 
 ## Phase 4 (4H контекст) — что осталось
 
@@ -43,7 +42,6 @@ Open items, roughly in priority order. Nothing here is urgent — the bot is liv
 
 - [ ] Whale on-chain tracking is scaffolded in `config.py` (`ASTER_CONTRACT_ADDRESS`, `ETHERSCAN_API_KEY`/`BSCSCAN_API_KEY`/`SUBSCAN_API_KEY`, `WHALE_THRESHOLD_ASTER`) but never wired into `run_live.py` — needs the ASTER token's actual contract chain confirmed first.
 - [ ] Twitter/X monitoring is scaffolded in `config.py` (`TWITTER_BEARER_TOKEN`, `TWITTER_WATCH_ACCOUNTS`) but never wired into `run_live.py`.
-- [ ] `CAPUSDT` doesn't exist on Binance Spot (confirmed via repeated 400 responses) — ask the user if they meant a different ticker, or if it's fine to leave it silently skipped indefinitely.
 - [ ] No automated tests exist for `technical_signals.py` beyond the ad-hoc synthetic bash checks run during development. Consider adding a small `pytest` suite so future changes to the Donchian logic can be verified without manual synthetic testing each time (`signal_stats/` has its own synthetic suite, `test_statistics.py`, see above — same idea, not yet unified under one `pytest` runner).
 
 ## Explicitly not a TODO

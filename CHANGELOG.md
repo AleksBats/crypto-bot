@@ -2,6 +2,11 @@
 
 All notable changes to the Aster Intelligence Bot, in chronological order. Dates are approximate (from the working conversation, not git commit timestamps — see the GitHub repo's commit history at `github.com/AleksBats/crypto-bot/commits/main` for exact timestamps and hashes).
 
+## 2026-08-09 (удаление CAPUSDT)
+
+- **Удалён** `CAPUSDT` из `TECHNICAL_SYMBOLS` по явному указанию пользователя. Тикера никогда не существовало на Binance Spot (`400 Bad Request` на каждый запрос, см. DECISIONS.md #10); после добавления часового контура он стал 400-ить дважды за цикл вместо одного раза. Осталось 16 символов: ASTERUSDT + 15 технических.
+- Больше ничего не изменено: индикаторы, пороги, cooldown, логика сигналов, статистика и контекст тренда не затронуты.
+
 ## 2026-08-09 (Phase 4 — контекст тренда 4H/1D, структура рынка, трендовая линия)
 
 Иерархия таймфреймов: 1D — глобальное направление, 4H — основной тренд и структура, 1H — поиск входа. **4H на этом этапе ничего не блокирует** — только описывает обстановку и копится в статистику, чтобы сначала проверить гипотезу на данных. Полный разбор в DECISIONS.md #14.
