@@ -66,6 +66,7 @@ from alert_engine import Signal, engine
 from state import state
 import telegram_bot as tg
 import technical_signals as ts
+import trend_context as tc
 from signal_stats import signal_tracker as stats_tracker
 from signal_stats.telegram_commands import run_command_listener
 
@@ -320,6 +321,41 @@ def _is_new_candle_signal(symbol: str, timeframe: str, setup: str,
 # evaluate_signals() и scan_technical_symbols(), что при добавлении 1H
 # означало бы четыре копии. См. DECISIONS.md #13.
 
+async def fetch_trend_context(client: httpx.AsyncClient, symbol: str) -> Optional[dict]:
+    """Контекст рынка по 4H и 1D для одного символа.
+
+    ⚠️  ВЫЗЫВАЕТСЯ ТОЛЬКО КОГДА СИГНАЛ УЖЕ СРАБОТАЛ И ПРОШЁЛ ДЕДУП —
+    не на каждой итерации цикла. Иначе это были бы лишние 34 запроса к
+    Binance каждые 5 минут ради данных, которые чаще всего никому не нужны.
+
+    ⚠️  РЕЗУЛЬТАТ ЗАМОРАЖИВАЕТСЯ В БД В МОМЕНТ СИГНАЛА. Пересчитывать его
+    при резолюции задним числом нельзя: рынок к тому времени уедет, и вся
+    статистика по alignment превратится в мусор. См. DECISIONS.md #14.
+
+    Возвращает None при любой ошибке — сигнал уйдёт без блока контекста,
+    но НЕ потеряется. 4H на этом этапе ничего не блокирует.
+    """
+    if not config.ENABLE_TREND_CONTEXT:
+        return None
+    try:
+        h4 = await fetch_klines(client, symbol, "4h",
+                                config.H4_KLINES_LIMIT, config.POLL_H4_SECS)
+        d1 = await fetch_klines(client, symbol, "1d",
+                                config.DAILY_KLINES_LIMIT, config.POLL_TECHNICAL_SECS)
+    except Exception as e:
+        logger.warning("Trend context fetch failed for %s: %s", symbol, e)
+        return None
+
+    try:
+        n = config.SWING_LOOKBACK
+        ctx_4h = tc.analyze(h4["highs"], h4["lows"], h4["close_times"], n=n)
+        ctx_1d = tc.analyze(d1["highs"], d1["lows"], d1["close_times"], n=n)
+        return {"h4": ctx_4h, "d1": ctx_1d}
+    except Exception as e:
+        logger.error("Trend context analyze failed for %s: %s", symbol, e)
+        return None
+
+
 async def _emit(client: httpx.AsyncClient, symbol: str, timeframe: str, setup: str,
                 direction: str, message_builder, signal_price: float, entry_level: float,
                 fast_n: int, candle_close_ts: int, strong: bool,
@@ -332,9 +368,26 @@ async def _emit(client: httpx.AsyncClient, symbol: str, timeframe: str, setup: s
         return False
 
     current_price = await fetch_current_price(client, symbol)
+
+    # Контекст 4H/1D — чистая информация. Если не получился, сигнал всё
+    # равно уходит: 4H ничего не блокирует (явное требование пользователя).
+    ctx = await fetch_trend_context(client, symbol)
+    trend_4h = ctx["h4"]["trend"] if ctx else None
+    trend_1d = ctx["d1"]["trend"] if ctx else None
+    structure_4h = ctx["h4"]["structure"] if ctx else None
+    alignment = tc.compute_alignment(direction, trend_4h, trend_1d)
+    trendline = ctx["h4"]["trendline"] if ctx else None
+
     key = f"{setup}_{direction.lower()}_{symbol}_{timeframe}"
     sent = await engine.submit(Signal(
-        key=key, strong=strong, message=message_builder(current_price), priority=2,
+        key=key, strong=strong,
+        message=message_builder(current_price) + tg.fmt_trend_context(
+            trend_1d, trend_4h, structure_4h,
+            ctx["h4"]["high_label"] if ctx else None,
+            ctx["h4"]["low_label"] if ctx else None,
+            alignment,
+        ),
+        priority=2,
     ))
     if not sent:
         return False
@@ -345,6 +398,11 @@ async def _emit(client: httpx.AsyncClient, symbol: str, timeframe: str, setup: s
             entry_price=signal_price, entry_level=entry_level, fast_n=fast_n,
             highs=highs, lows=lows, closes=closes,
             timeframe=timeframe, candle_close_ts=candle_close_ts,
+            trend_1d=trend_1d, trend_4h=trend_4h, structure_4h=structure_4h,
+            alignment=alignment,
+            trendline_slope=trendline["slope"] if trendline else None,
+            trendline_anchor_ts=trendline["anchor_ts"] if trendline else None,
+            trendline_anchor_price=trendline["anchor_price"] if trendline else None,
         )
     except Exception as e:
         logger.error("statistics: record_signal failed (%s %s %s): %s", symbol, setup, timeframe, e)

@@ -55,12 +55,19 @@ class InMemoryStore:
 
     async def insert_signal(self, id, fired_at, symbol, direction, setup,
                              entry_price, entry_level, fast_n, initial_risk_pct,
-                             rsi_at_entry, timeframe="1d", candle_close_ts=None):
+                             rsi_at_entry, timeframe="1d", candle_close_ts=None,
+                             trend_1d=None, trend_4h=None, structure_4h=None,
+                             alignment=None, trendline_slope=None,
+                             trendline_anchor_ts=None, trendline_anchor_price=None):
         row = {
             "id": id, "fired_at": fired_at, "symbol": symbol, "timeframe": timeframe,
             "direction": direction, "setup": setup, "entry_price": entry_price,
             "entry_level": entry_level, "fast_n": fast_n, "initial_risk_pct": initial_risk_pct,
             "rsi_at_entry": rsi_at_entry, "candle_close_ts": candle_close_ts,
+            "trend_1d": trend_1d, "trend_4h": trend_4h, "structure_4h": structure_4h,
+            "alignment": alignment, "trendline_slope": trendline_slope,
+            "trendline_anchor_ts": trendline_anchor_ts,
+            "trendline_anchor_price": trendline_anchor_price,
             "status": "OPEN", "resolved_at": None,
             "resolved_price": None, "resolved_reason": None, "mfe_pct": 0.0, "mae_pct": 0.0,
             "r_multiple": None,

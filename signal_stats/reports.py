@@ -122,6 +122,46 @@ def _symbols_block(agg: dict) -> list[str]:
 TF_LABELS = {"1d": "1D", "1h": "1H"}
 
 
+ALIGN_LABELS = {
+    "STRONG":   "1D + 4H + сигнал",
+    "PARTIAL":  "только 4H + сигнал",
+    "CONFLICT": "против 4H",
+    "UNKNOWN":  "контекст н/д",
+}
+
+
+def _alignment_block(agg: dict) -> list[str]:
+    """Эффективность сигналов в разрезе согласованности со старшими ТФ.
+
+    Группы с малой выборкой помечаются явно: показывать «100% win rate»
+    на трёх сделках — это вводить в заблуждение, а не информировать.
+    """
+    lines = ["", "🧭 <b>СОГЛАСОВАННОСТЬ ТАЙМФРЕЙМОВ</b>"]
+    by_align = agg.get("by_alignment") or {}
+    if not by_align:
+        lines.append("N/A — пока нет закрытых сигналов с контекстом 4H")
+        return lines
+
+    order = ["STRONG", "PARTIAL", "CONFLICT", "UNKNOWN"]
+    for key in sorted(by_align, key=lambda k: order.index(k) if k in order else 99):
+        s = by_align[key]
+        label = ALIGN_LABELS.get(key, key)
+        small = " <i>(мало данных)</i>" if s["signals"] < config.MIN_SAMPLE_FOR_RANKING else ""
+        lines.append(
+            f"<b>{key}</b> ({label}) — {s['signals']} сигн., {_wr(s['win_rate_pct'])} WR, "
+            f"R {_r(s['avg_r'])}{small}"
+        )
+        lines.append(f"    MFE {_pct(s['avg_mfe_pct'])} · MAE {_pct(s['avg_mae_pct'])}")
+
+    by_tf4 = agg.get("by_trend_4h") or {}
+    if by_tf4:
+        lines.append("")
+        lines.append("<b>По направлению 4H тренда</b>")
+        for tr, s in sorted(by_tf4.items()):
+            lines.append(f"{tr} — {s['signals']} сигн., {_wr(s['win_rate_pct'])} WR, R {_r(s['avg_r'])}")
+    return lines
+
+
 def _timeframe_block(agg: dict) -> list[str]:
     """Реальная разбивка по таймфреймам. До появления часового контура здесь
     стояло честное N/A, потому что все сигналы были дневными — теперь данные
@@ -145,6 +185,7 @@ def _assemble(header: str, period_line: str, agg: dict) -> str:
     lines += _setups_block(agg)
     lines += _symbols_block(agg)
     lines += _timeframe_block(agg)
+    lines += _alignment_block(agg)
     return "\n".join(lines)
 
 

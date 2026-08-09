@@ -57,11 +57,15 @@ def _group_breakdown(closed_signals: list[dict], key: str) -> dict:
     result = {}
     for k, subset in groups.items():
         wins = [s for s in subset if s["status"] == "WIN"]
+        rs = [s["r_multiple"] for s in subset if s.get("r_multiple") is not None]
         result[k] = {
             "signals": len(subset),
             "wins": len(wins),
             "losses": len(subset) - len(wins),
             "win_rate_pct": len(wins) / len(subset) * 100,
+            "avg_r": (sum(rs) / len(rs)) if rs else None,
+            "avg_mfe_pct": sum(s["mfe_pct"] for s in subset) / len(subset),
+            "avg_mae_pct": sum(s["mae_pct"] for s in subset) / len(subset),
         }
     return result
 
@@ -97,6 +101,12 @@ def aggregate(signals: list[dict]) -> dict:
 
     by_symbol = _group_breakdown(closed, "symbol")
     by_timeframe = _group_breakdown(closed, "timeframe")
+    # Группировка по согласованности со старшими таймфреймами (Phase 4).
+    # Сигналы без контекста (alignment IS NULL) в разбивку не попадают —
+    # они не относятся ни к одной группе, и подмешивать их было бы враньём.
+    with_align = [s for s in closed if s.get("alignment")]
+    by_alignment = _group_breakdown(with_align, "alignment")
+    by_trend_4h = _group_breakdown([s for s in closed if s.get("trend_4h")], "trend_4h")
     by_setup = _group_breakdown(closed, "setup")
     best_symbol, worst_symbol = _best_worst_by_win_rate(by_symbol)
     best_setup, worst_setup = _best_worst_by_win_rate(by_setup)
@@ -128,6 +138,9 @@ def aggregate(signals: list[dict]) -> dict:
 
         "by_symbol": by_symbol,
         "by_timeframe": by_timeframe,
+        "by_alignment": by_alignment,
+        "by_trend_4h": by_trend_4h,
+        "aligned_closed": len(with_align),
         "by_setup": by_setup,
         "best_symbol": best_symbol,
         "worst_symbol": worst_symbol,

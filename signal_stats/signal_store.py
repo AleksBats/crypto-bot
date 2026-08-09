@@ -51,6 +51,16 @@ CREATE TABLE IF NOT EXISTS signals (
     candle_close_ts BIGINT,                      -- close_time свечи-источника (мс), для дедупа по свече
     initial_risk_pct DOUBLE PRECISION NOT NULL, -- |entry - invalidation band| / entry * 100, frozen at entry, for R multiples
     rsi_at_entry    DOUBLE PRECISION,
+    -- ── Контекст 4H/1D (Phase 4). ЗАМОРАЖИВАЕТСЯ в момент сигнала и
+    -- никогда не пересчитывается — иначе статистика по alignment теряет
+    -- смысл. NULL = контекст был недоступен. См. DECISIONS.md #14.
+    trend_1d        TEXT,                        -- BULLISH | BEARISH | NEUTRAL
+    trend_4h        TEXT,
+    structure_4h    TEXT,                        -- HH_HL | LH_LL | MIXED
+    alignment       TEXT,                        -- STRONG | PARTIAL | CONFLICT | UNKNOWN
+    trendline_slope       DOUBLE PRECISION,      -- цена за миллисекунду
+    trendline_anchor_ts   BIGINT,
+    trendline_anchor_price DOUBLE PRECISION,
     status          TEXT NOT NULL DEFAULT 'OPEN', -- OPEN | WIN | LOSS
     resolved_at     TIMESTAMPTZ,
     resolved_price  DOUBLE PRECISION,
@@ -69,6 +79,15 @@ CREATE INDEX IF NOT EXISTS idx_signals_timeframe ON signals (timeframe);
 -- Миграция для БД, созданных до появления часового контура: колонка
 -- добавляется идемпотентно, существующие строки остаются с NULL.
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS candle_close_ts BIGINT;
+-- Миграция Phase 4: контекст тренда. Существующие строки остаются с NULL.
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS trend_1d TEXT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS trend_4h TEXT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS structure_4h TEXT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS alignment TEXT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS trendline_slope DOUBLE PRECISION;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS trendline_anchor_ts BIGINT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS trendline_anchor_price DOUBLE PRECISION;
+CREATE INDEX IF NOT EXISTS idx_signals_alignment ON signals (alignment);
 """
 
 
@@ -121,6 +140,10 @@ async def insert_signal(
     entry_price: float, entry_level: float, fast_n: int, initial_risk_pct: float,
     rsi_at_entry: Optional[float], timeframe: str = "1d",
     candle_close_ts: Optional[int] = None,
+    trend_1d: Optional[str] = None, trend_4h: Optional[str] = None,
+    structure_4h: Optional[str] = None, alignment: Optional[str] = None,
+    trendline_slope: Optional[float] = None, trendline_anchor_ts: Optional[int] = None,
+    trendline_anchor_price: Optional[float] = None,
 ) -> Optional[dict]:
     pool = await get_pool()
     if pool is None:
@@ -130,13 +153,15 @@ async def insert_signal(
         """INSERT INTO signals
              (id, fired_at, symbol, timeframe, direction, setup,
               entry_price, entry_level, fast_n, initial_risk_pct, rsi_at_entry,
-              candle_close_ts)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+              candle_close_ts, trend_1d, trend_4h, structure_4h, alignment,
+              trendline_slope, trendline_anchor_ts, trendline_anchor_price)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
            ON CONFLICT (id) DO NOTHING
            RETURNING *""",
         id, fired_at, symbol, timeframe, direction, setup,
         entry_price, entry_level, fast_n, initial_risk_pct, rsi_at_entry,
-        candle_close_ts,
+        candle_close_ts, trend_1d, trend_4h, structure_4h, alignment,
+        trendline_slope, trendline_anchor_ts, trendline_anchor_price,
     )
     return _row_to_dict(row)
 

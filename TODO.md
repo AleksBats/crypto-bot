@@ -26,6 +26,13 @@ Open items, roughly in priority order. Nothing here is urgent — the bot is liv
 - [ ] Дедуп по свече живёт в памяти процесса — после рестарта Render возможна одна повторная отправка на свечу. Если это будет мешать, перенести в Neon (колонка `candle_close_ts` уже есть). Пока сознательно не сделано: дедуп не должен зависеть от наличия БД.
 - [ ] `CAPUSDT` по-прежнему в списке по вашему решению и по-прежнему 400-ит на каждом цикле. Теперь запросов вдвое больше (1D + 1H), то есть и warning'ов вдвое. Решить окончательно.
 
+## Phase 4 (4H контекст) — что осталось
+
+- [ ] **Накопить данные, прежде чем делать выводы.** Блок «СОГЛАСОВАННОСТЬ ТАЙМФРЕЙМОВ» станет осмысленным при десятках закрытых сигналов в каждой группе — это недели, а не дни. Группы с выборкой меньше `MIN_SAMPLE_FOR_RANKING` помечаются как «мало данных», но это не отменяет здравого смысла: не принимайте решений по трём сделкам.
+- [ ] Решить по итогам данных, стоит ли переходить ко второму этапу — фильтрации сигналов по 4H. Сейчас 4H сознательно ничего не блокирует. Это отдельное решение пользователя, а не доработка.
+- [ ] Проверить `trendline.pine` на реальном графике TradingView и сверить с тем, что бот пишет в `trendline_slope`/`trendline_anchor_*`. Должны совпасть при том же символе на BINANCE, том же ТФ и `swingLookback` = `SWING_LOOKBACK`.
+- [ ] Подобрать `SWING_LOOKBACK` на живых данных: 2 даёт больше точек и быстрее реагирует, 3 — чище структура, но подтверждение через 12 часов на 4H. Меняется переменной окружения без правки кода.
+
 ## Cleanup
 
 - [ ] The GitHub repo's own `requirements.txt` and `env_example.txt` still reference the unrelated `crypto_bot.py` bot's dependencies (`anthropic`, `requests`, `schedule`, `CLAUDE_API_KEY`, etc.), not `run_live.py`'s actual needs. This folder's copies were corrected (see DECISIONS.md #8); the GitHub repo itself was not. Consider pushing the corrected versions there too, or clearly separating the two bots into different repos/folders.

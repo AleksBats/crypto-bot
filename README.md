@@ -15,6 +15,8 @@ A 24/7 Python bot that polls Binance's free public REST API and sends Telegram a
 
 **Two timeframes in parallel — 1D and 1H**, computed on **closed candles only**. A signal can never appear mid-candle and then change its mind. Alerts show two separate prices: the close of the candle that created the signal, and a fresh market price fetched right before sending. The same signal is never re-sent for the same candle. See DECISIONS.md #13.
 
+**Trend context (4H + 1D)** — every signal is annotated with market structure (HH/HL/LH/LL), trend direction and a dynamic trendline built from confirmed swing points. **It never blocks or alters a signal** — it is informational and accumulates in the statistics so the hypothesis can be tested on real data first. Swing points are only confirmed once `SWING_LOOKBACK` candles have closed to their right, so there is no look-ahead and the trendline never repaints. `trendline.pine` reproduces the identical formula on TradingView. See DECISIONS.md #14.
+
 All three technical indicators are standard Donchian-channel implementations (not exact copies of any TradingView Pine script — see CLAUDE.md/DECISIONS.md).
 
 ## Signal performance statistics / paper trading
@@ -52,12 +54,15 @@ No automatic weekly push yet — implemented and tested, not scheduled (delibera
 | `alert_engine.py` | Decides when a signal becomes a Telegram message (cooldowns, weak-signal combos). |
 | `telegram_bot.py` | Sends HTML-formatted messages via the Telegram Bot API. |
 | `technical_signals.py` | Pure functions: `detect_breakout`, `detect_turtle_zone`, `detect_failure_test`. |
+| `trend_context.py` | Pure functions: swing detection, HH/HL/LH/LL structure, trend, trendline. Informational only. |
+| `trendline.pine` | TradingView indicator reproducing the same trendline formula. |
 | `signal_stats/signal_store.py` | Postgres persistence (Neon) — all SQL lives here. |
 | `signal_stats/signal_tracker.py` | Records signals, resolves WIN/LOSS/OPEN, computes RSI, detects combo setups. |
 | `signal_stats/performance.py` | Pure aggregation: win rate, R, MFE/MAE, Profit Factor, breakdowns. |
 | `signal_stats/reports.py` | Builds the `/today /week /month /stats` Telegram messages. |
 | `signal_stats/telegram_commands.py` | Long-polls Telegram for incoming commands. |
 | `test_statistics.py` | Synthetic tests for the whole statistics package (54 checks, in-memory store). |
+| `test_trend_context.py` | Synthetic tests for 4H context (53 checks: look-ahead, repaint, frozen context). |
 | `requirements.txt` | Python dependencies (`httpx`, `python-dotenv`, `asyncpg`). |
 
 ## Running locally

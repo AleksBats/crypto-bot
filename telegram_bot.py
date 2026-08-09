@@ -174,6 +174,54 @@ def fmt_failure_test_alert(symbol: str, direction: str, level: float, signal_pri
 
 
 # ─────────────────────────────────────────────────────────────
+#  Блок КОНТЕКСТ (4H / 1D) — Phase 4
+#
+#  ⚠️  Это ЧИСТО ИНФОРМАЦИОННЫЙ блок. 4H на данном этапе не блокирует
+#  сигналы и не меняет их — он только описывает обстановку и копится в
+#  статистику. Сигнал с alignment=CONFLICT отправляется ровно так же,
+#  как и со STRONG. См. DECISIONS.md #14.
+# ─────────────────────────────────────────────────────────────
+
+_TREND_EMOJI = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "🟡"}
+_ALIGN_LABEL = {
+    "STRONG":   "STRONG (1D + 4H + сигнал в одну сторону)",
+    "PARTIAL":  "PARTIAL (4H согласован, 1D нет)",
+    "CONFLICT": "CONFLICT (4H против сигнала)",
+    "UNKNOWN":  "н/д (контекст недоступен)",
+}
+
+
+def _trend_line(label: str, trend: Optional[str]) -> str:
+    if not trend:
+        return f"{label}: <i>н/д</i>"
+    return f"{label}: {_TREND_EMOJI.get(trend, '')} {trend}"
+
+
+def fmt_trend_context(trend_1d: Optional[str], trend_4h: Optional[str],
+                       structure_4h: Optional[str], high_label: Optional[str],
+                       low_label: Optional[str], alignment: Optional[str]) -> str:
+    """Дописывается в конец сообщения о сигнале.
+
+    Если контекст вообще не удалось получить — возвращается пустая строка,
+    и сообщение выглядит ровно как раньше. Никаких выдуманных значений."""
+    if not trend_4h and not trend_1d:
+        return ""
+
+    lines = ["", "📐 <b>КОНТЕКСТ</b>"]
+    lines.append(_trend_line("1D тренд", trend_1d))
+    lines.append(_trend_line("4H тренд", trend_4h))
+
+    if high_label and low_label:
+        lines.append(f"4H структура: {high_label} / {low_label}")
+    elif structure_4h == "MIXED":
+        lines.append("4H структура: <i>не подтверждена (мало swing-точек)</i>")
+
+    if alignment:
+        lines.append(f"→ Alignment: <b>{_ALIGN_LABEL.get(alignment, alignment)}</b>")
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────
 #  DEPRECATED — first-prototype signal accuracy report (see top-level
 #  signal_tracker.py). Superseded by statistics/reports.py, which builds
 #  the /stats /week /today /month messages directly. Not called by

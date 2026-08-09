@@ -64,6 +64,22 @@ HOURLY_KLINES_LIMIT   = int(os.environ.get("HOURLY_KLINES_LIMIT", "200"))  # ч�
 # и 15-минутный кэш задерживал бы обнаружение новой закрытой свечи.
 POLL_HOURLY_SECS      = int(os.environ.get("POLL_HOURLY_SECS", "300"))     # 5 мин
 
+# ── 4H контекст тренда (Phase 4) ─────────────────────────────────────────────
+# ⚠️  ЭТО НЕ ТОРГОВЫЕ ПОРОГИ. 4H не порождает сигналов и ничего не блокирует —
+# только описывает контекст рынка и копится в статистику. Индикаторы
+# Breakout / Turtle Zone / Failure Test и их параметры не затронуты.
+# См. DECISIONS.md #14.
+ENABLE_TREND_CONTEXT = os.environ.get("ENABLE_TREND_CONTEXT", "true").lower() in ("1", "true", "yes")
+
+# Окно подтверждения swing point: N свечей слева И справа. Единственное
+# новое число во всей фиче — выбрано пользователем явно, не подставлено.
+# 2 = классические фракталы Билла Уильямса, дефолт ta.pivothigh в TradingView.
+# Больше N → чище структура, но дольше подтверждение (N × длительность свечи).
+SWING_LOOKBACK = int(os.environ.get("SWING_LOOKBACK", "2"))
+
+H4_KLINES_LIMIT = int(os.environ.get("H4_KLINES_LIMIT", "200"))  # 4H свечей на загрузку
+POLL_H4_SECS    = int(os.environ.get("POLL_H4_SECS",    "900"))  # 15 мин — 4H свеча закрывается редко
+
 # Список монет, по которым Breakout / Turtle Zone Filter / Failure Test
 # сканируются ОТДЕЛЬНО от основного SYMBOL_SPOT (ASTERUSDT). Для этих монет
 # шлются только сигналы этих трёх индикаторов — без volume/OI/funding.

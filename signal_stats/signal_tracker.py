@@ -93,6 +93,10 @@ async def record_signal(
     entry_price: float, entry_level: float, fast_n: int,
     highs: list[float], lows: list[float], closes: list[float],
     timeframe: str = "1d", candle_close_ts: Optional[int] = None,
+    trend_1d: Optional[str] = None, trend_4h: Optional[str] = None,
+    structure_4h: Optional[str] = None, alignment: Optional[str] = None,
+    trendline_slope: Optional[float] = None, trendline_anchor_ts: Optional[int] = None,
+    trendline_anchor_price: Optional[float] = None,
     store=_default_store,
 ) -> Optional[str]:
     """Records a fired-and-actually-sent signal. Returns the new signal id,
@@ -122,6 +126,12 @@ async def record_signal(
         setup=setup, entry_price=entry_price, entry_level=entry_level, fast_n=fast_n,
         initial_risk_pct=initial_risk_pct, rsi_at_entry=rsi_at_entry,
         timeframe=timeframe, candle_close_ts=candle_close_ts,
+        # Контекст 4H/1D замораживается ЗДЕСЬ, в момент сигнала.
+        # resolve_open_signals() его НЕ трогает — см. DECISIONS.md #14.
+        trend_1d=trend_1d, trend_4h=trend_4h, structure_4h=structure_4h,
+        alignment=alignment, trendline_slope=trendline_slope,
+        trendline_anchor_ts=trendline_anchor_ts,
+        trendline_anchor_price=trendline_anchor_price,
     )
     if row is None:
         return None

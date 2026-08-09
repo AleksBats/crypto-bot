@@ -1,0 +1,119 @@
+// © Aster Intelligence Bot — trend structure & trendline
+// Точная копия формулы из trend_context.py (Python-бот). См. DECISIONS.md #14.
+//
+// ЗАЧЕМ: Python-бот физически не может рисовать на графике TradingView —
+// у TradingView нет API для внешней отрисовки. Поэтому здесь повторена
+// ТА ЖЕ САМАЯ математика, чтобы вы видели на графике ровно то, что бот
+// считает у себя.
+//
+// ЧТОБЫ ЛИНИИ СОВПАДАЛИ, ОБЯЗАТЕЛЬНО:
+//   1) тот же символ и та же биржа — BINANCE (не другой источник данных);
+//   2) тот же таймфрейм — 4H для контекста, 1D для глобального направления;
+//   3) тот же swingLookback, что и SWING_LOOKBACK в Render (по умолчанию 2).
+//
+// ОТСУТСТВИЕ ПЕРЕРИСОВКИ: ta.pivothigh/ta.pivotlow в Pine возвращают
+// значение со сдвигом на `right` баров назад — они не видят будущее, ровно
+// как find_swings() в Python не берёт кандидатов из последних N свечей.
+// Обе реализации подтверждают точку только после закрытия N баров справа.
+
+//@version=5
+indicator("Aster Bot — Structure & Trendline", overlay = true)
+
+swingLookback = input.int(2, "Swing lookback (= SWING_LOOKBACK в боте)", minval = 1)
+showLabels    = input.bool(true,  "Показывать метки HH / HL / LH / LL")
+showLine      = input.bool(true,  "Показывать трендовую линию")
+extendLine    = input.bool(true,  "Продлевать линию вправо")
+
+// ── Подтверждённые swing-точки ───────────────────────────────────────────
+// Идентично find_swings() в trend_context.py: строгий экстремум на окне
+// [i-N, i+N]. Pine отдаёт результат уже с задержкой N баров.
+ph = ta.pivothigh(high, swingLookback, swingLookback)
+pl = ta.pivotlow(low,  swingLookback, swingLookback)
+
+// Две последние подтверждённые точки каждого типа + их время.
+// var = переменные переживают бар и не пересчитываются задним числом.
+var float lastHigh = na, var float prevHigh = na
+var int   lastHighT = na, var int prevHighT = na
+var float lastLow  = na, var float prevLow  = na
+var int   lastLowT = na, var int prevLowT = na
+
+if not na(ph)
+    prevHigh  := lastHigh
+    prevHighT := lastHighT
+    lastHigh  := ph
+    // Пивот подтверждён сейчас, но принадлежит бару N назад
+    lastHighT := time[swingLookback]
+
+if not na(pl)
+    prevLow  := lastLow
+    prevLowT := lastLowT
+    lastLow  := pl
+    lastLowT := time[swingLookback]
+
+// ── Структура рынка ──────────────────────────────────────────────────────
+// Идентично classify_structure(): сравнение двух последних точек каждого типа.
+isHH = not na(lastHigh) and not na(prevHigh) and lastHigh > prevHigh
+isLH = not na(lastHigh) and not na(prevHigh) and lastHigh <= prevHigh
+isHL = not na(lastLow)  and not na(prevLow)  and lastLow  > prevLow
+isLL = not na(lastLow)  and not na(prevLow)  and lastLow  <= prevLow
+
+// HH + HL → bullish · LH + LL → bearish · остальное → neutral
+isBull = isHH and isHL
+isBear = isLH and isLL
+
+// ── Трендовая линия по двум последним подтверждённым точкам ──────────────
+// Идентично build_trendline():
+//     bullish → по swing lows, bearish → по swing highs
+//     slope = (y2 - y1) / (x2 - x1),  x — время в миллисекундах
+// В Python наклон хранится как «цена за миллисекунду» — здесь то же самое,
+// поэтому значения линии в любой момент времени совпадают до float-точности.
+var line trendLine = na
+
+if showLine and barstate.islast
+    if not na(trendLine)
+        line.delete(trendLine)
+
+    if isBull and not na(lastLow) and not na(prevLow) and prevLowT != lastLowT
+        trendLine := line.new(prevLowT, prevLow, lastLowT, lastLow,
+                               xloc  = xloc.bar_time,
+                               color = color.new(color.teal, 0),
+                               width = 2,
+                               extend = extendLine ? extend.right : extend.none)
+    else if isBear and not na(lastHigh) and not na(prevHigh) and prevHighT != lastHighT
+        trendLine := line.new(prevHighT, prevHigh, lastHighT, lastHigh,
+                               xloc  = xloc.bar_time,
+                               color = color.new(color.red, 0),
+                               width = 2,
+                               extend = extendLine ? extend.right : extend.none)
+
+// ── Метки HH / HL / LH / LL ──────────────────────────────────────────────
+if showLabels and not na(ph)
+    label.new(bar_index[swingLookback], ph,
+              text  = lastHigh > nz(prevHigh, lastHigh - 1) ? "HH" : "LH",
+              style = label.style_label_down,
+              color = color.new(color.gray, 80),
+              textcolor = color.white,
+              size  = size.tiny)
+
+if showLabels and not na(pl)
+    label.new(bar_index[swingLookback], pl,
+              text  = lastLow > nz(prevLow, lastLow + 1) ? "HL" : "LL",
+              style = label.style_label_up,
+              color = color.new(color.gray, 80),
+              textcolor = color.white,
+              size  = size.tiny)
+
+// ── Индикация тренда ─────────────────────────────────────────────────────
+// Совпадает с trend_from_structure(): тренд ЕСТЬ структура, отдельного
+// индикатора намеренно нет.
+bgcolor(isBull ? color.new(color.teal, 93) : isBear ? color.new(color.red, 93) : na)
+
+var table info = table.new(position.top_right, 1, 3, border_width = 1)
+if barstate.islast
+    trendTxt = isBull ? "🟢 BULLISH" : isBear ? "🔴 BEARISH" : "🟡 NEUTRAL"
+    structTxt = na(lastHigh) or na(prevHigh) or na(lastLow) or na(prevLow)
+                 ? "структура не подтверждена"
+                 : (isHH ? "HH" : "LH") + " / " + (isHL ? "HL" : "LL")
+    table.cell(info, 0, 0, "Aster Bot", text_color = color.gray, text_size = size.small)
+    table.cell(info, 0, 1, trendTxt, text_size = size.normal)
+    table.cell(info, 0, 2, structTxt, text_color = color.gray, text_size = size.small)
