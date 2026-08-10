@@ -66,6 +66,8 @@ from alert_engine import Signal, engine
 from state import state
 import telegram_bot as tg
 import technical_signals as ts
+import trade_state
+from signal_stats import signal_store
 import trend_context as tc
 from signal_stats import signal_tracker as stats_tracker
 from signal_stats.telegram_commands import run_command_listener
@@ -356,42 +358,49 @@ async def fetch_trend_context(client: httpx.AsyncClient, symbol: str) -> Optiona
         return None
 
 
-async def _emit(client: httpx.AsyncClient, symbol: str, timeframe: str, setup: str,
-                direction: str, message_builder, signal_price: float, entry_level: float,
-                fast_n: int, candle_close_ts: int, strong: bool,
-                highs: list, lows: list, closes: list) -> bool:
-    """Дедуп по свече → свежая цена → отправка → запись в статистику.
+# ── Реестр открытых сделок (Telegram output layer) ───────────────────────────
+# Один символ = максимум одна активная сделка. Пока она открыта, новые
+# торговые сообщения по этому символу не отправляются, но индикаторы
+# считаются как обычно и всё пишется в Neon.
+open_trades = trade_state.OpenTradeRegistry(config.MAX_ACTIVE_TRADES)
 
-    Порядок важен: свежая цена запрашивается ТОЛЬКО после того, как дедуп
-    пропустил сигнал — иначе на каждой итерации летели бы лишние запросы."""
-    if not _is_new_candle_signal(symbol, timeframe, setup, direction, candle_close_ts):
-        return False
 
-    current_price = await fetch_current_price(client, symbol)
+async def restore_open_trades():
+    """Восстановление состояния после перезапуска Render.
 
-    # Контекст 4H/1D — чистая информация. Если не получился, сигнал всё
-    # равно уходит: 4H ничего не блокирует (явное требование пользователя).
-    ctx = await fetch_trend_context(client, symbol)
+    Без этого после каждого redeploy бот заново отправил бы сигналы по уже
+    открытым сделкам. Если БД не настроена — работаем только на памяти,
+    о чём честно пишем в лог."""
+    if not config.DATABASE_URL:
+        logger.warning(
+            "trade_state: DATABASE_URL не задан — OPEN-состояние живёт только в "
+            "памяти и будет потеряно при рестарте."
+        )
+        return
+    try:
+        rows = await signal_store.get_open_trades()
+        open_trades.restore(rows)
+    except Exception as e:
+        logger.error("trade_state: не удалось восстановить открытые сделки: %s", e)
+
+
+async def _record_detector(client: httpx.AsyncClient, symbol: str, timeframe: str,
+                            setup: str, direction: str, signal_price: float,
+                            entry_level: float, fast_n: int, candle_close_ts: int,
+                            highs: list, lows: list, closes: list, ctx: Optional[dict]):
+    """Пишет сработавший детектор в Neon.
+
+    ИЗМЕНЕНИЕ ОТНОСИТЕЛЬНО ПРЕЖНЕГО ПОВЕДЕНИЯ: раньше запись происходила
+    только если сообщение реально ушло в Telegram. Теперь Telegram получает
+    одно сообщение вместо трёх, поэтому привязка к отправке уничтожила бы
+    статистику — пишем КАЖДЫЙ сработавший детектор. Правило WIN/LOSS,
+    структура таблицы signals и агрегации не тронуты.
+    """
     trend_4h = ctx["h4"]["trend"] if ctx else None
     trend_1d = ctx["d1"]["trend"] if ctx else None
     structure_4h = ctx["h4"]["structure"] if ctx else None
     alignment = tc.compute_alignment(direction, trend_4h, trend_1d)
     trendline = ctx["h4"]["trendline"] if ctx else None
-
-    key = f"{setup}_{direction.lower()}_{symbol}_{timeframe}"
-    sent = await engine.submit(Signal(
-        key=key, strong=strong,
-        message=message_builder(current_price) + tg.fmt_trend_context(
-            trend_1d, trend_4h, structure_4h,
-            ctx["h4"]["high_label"] if ctx else None,
-            ctx["h4"]["low_label"] if ctx else None,
-            alignment,
-        ),
-        priority=2,
-    ))
-    if not sent:
-        return False
-
     try:
         await stats_tracker.record_signal(
             symbol=symbol, direction=direction, setup=setup,
@@ -406,12 +415,136 @@ async def _emit(client: httpx.AsyncClient, symbol: str, timeframe: str, setup: s
         )
     except Exception as e:
         logger.error("statistics: record_signal failed (%s %s %s): %s", symbol, setup, timeframe, e)
+
+
+async def _check_trade_close(symbol: str, timeframe: str, highs: list, lows: list,
+                              close_times: list):
+    """TARGET HIT / STOP HIT по закрытым свечам. Освобождает символ."""
+    trade = open_trades.get(symbol)
+    if not trade or trade.get("timeframe") != timeframe:
+        return
+
+    hit = trade_state.check_close(
+        trade["direction"], float(trade["stop"]),
+        float(trade["target_primary"]) if trade.get("target_primary") is not None else None,
+        highs, lows, close_times, since_ts=int(trade.get("candle_close_ts") or 0),
+    )
+    if not hit:
+        return
+
+    open_trades.mark_closed(symbol, hit["ts"], timeframe)
+    logger.info("trade_state: %s %s -> %s @ %.8f", symbol, trade["direction"],
+                hit["reason"], hit["price"])
+
+    if trade.get("id"):
+        try:
+            await signal_store.close_active_trade(
+                str(trade["id"]), hit["reason"], hit["price"], hit["ts"])
+        except Exception as e:
+            logger.error("trade_state: close_active_trade failed (%s): %s", symbol, e)
+
+    try:
+        await tg.send_alert(tg.fmt_trade_closed(
+            symbol, timeframe, trade["direction"], trade.get("setup", ""),
+            hit["reason"], hit["price"], float(trade["entry"]),
+        ))
+    except Exception as e:
+        logger.error("trade_state: не удалось отправить уведомление о закрытии: %s", e)
+
+
+async def _send_trade_signal(symbol: str, timeframe: str, direction: str,
+                              setups: list, entry: float, level: Optional[float],
+                              highs: list, lows: list, candle_close_ts: int) -> bool:
+    """ЕДИНСТВЕННАЯ точка отправки технического сигнала в Telegram."""
+    # Границы канала для MMO берутся тем же приватным хелпером, что и сами
+    # детекторы, — чтобы определение канала не могло разойтись с индикатором.
+    channel_high = channel_low = None
+    if level is not None:
+        try:
+            channel_high, channel_low = ts._donchian(highs, lows, config.DONCHIAN_LOOKBACK)
+        except Exception:
+            channel_high = channel_low = None
+
+    levels = trade_state.build_levels(
+        direction, entry, level, channel_high, channel_low,
+        config.STOP_BUFFER_PCT, config.DEFAULT_STOP_PCT,
+    )
+    if not levels:
+        logger.info("trade_state: %s %s — некорректные уровни, сигнал не отправлен",
+                    symbol, direction)
+        return False
+
+    pos = trade_state.position_size(
+        levels["entry"], levels["stop"],
+        config.ACCOUNT_SIZE, config.RISK_PCT, config.LEVERAGE,
+    )
+    label = trade_state.setup_label(setups)
+    target = trade_state.primary_target(levels)
+
+    # Гейт проверяется ПОСЛЕ расчёта уровней — специально, чтобы у
+    # неотправленного кандидата в Neon остались посчитанные entry/stop/target.
+    # Тогда потом можно честно ответить на вопрос "что мы пропустили, пока
+    # были заняты три слота", а не гадать.
+    reason = open_trades.blocked_reason(symbol)
+    if reason:
+        status = trade_state.SKIP_STATUS.get(reason, "SKIPPED")
+        logger.info("trade_state: %s %s подавлен (%s -> %s), активно %d/%d",
+                    symbol, direction, reason, status,
+                    open_trades.open_count(), config.MAX_ACTIVE_TRADES)
+        try:
+            await signal_store.insert_trade_candidate(
+                symbol=symbol, timeframe=timeframe, direction=levels["direction"],
+                setup=label, entry=levels["entry"], stop=levels["stop"],
+                target_mmo=levels["target_mmo"], target_1r=levels["target_1r"],
+                target_primary=target, risk_pct=levels["risk_pct"],
+                notional=pos["notional"] if pos else None,
+                margin=pos["margin"] if pos else None,
+                risk_usd=pos["risk_usd"] if pos else None,
+                candle_close_ts=candle_close_ts, status=status,
+            )
+        except Exception as e:
+            logger.error("trade_state: не удалось сохранить пропущенного кандидата (%s): %s", symbol, e)
+        return False
+
+    sent = await tg.send_alert(tg.fmt_trade_signal(symbol, timeframe, levels, pos, label))
+    if not sent:
+        return False
+
+    trade = {
+        "symbol": symbol, "timeframe": timeframe, "direction": levels["direction"],
+        "setup": label, "entry": levels["entry"], "stop": levels["stop"],
+        "target_mmo": levels["target_mmo"], "target_1r": levels["target_1r"],
+        "target_primary": target, "candle_close_ts": candle_close_ts, "id": None,
+    }
+    try:
+        trade["id"] = await signal_store.insert_trade_candidate(
+            symbol=symbol, timeframe=timeframe, direction=levels["direction"],
+            setup=label, entry=levels["entry"], stop=levels["stop"],
+            target_mmo=levels["target_mmo"], target_1r=levels["target_1r"],
+            target_primary=target, risk_pct=levels["risk_pct"],
+            notional=pos["notional"] if pos else None,
+            margin=pos["margin"] if pos else None,
+            risk_usd=pos["risk_usd"] if pos else None,
+            candle_close_ts=candle_close_ts,
+        )
+    except Exception as e:
+        logger.error("trade_state: insert_trade_candidate failed (%s): %s", symbol, e)
+
+    open_trades.mark_open(trade)
+    logger.info("trade_state: OPEN %s %s %s (открыто %d/%d)",
+                symbol, levels["direction"], label,
+                open_trades.open_count(), config.MAX_ACTIVE_TRADES)
     return True
 
 
 async def scan_technical(client: httpx.AsyncClient, symbol: str, timeframe: str,
                           limit: int, cache_ttl: int):
-    """Считает три индикатора по ЗАКРЫТЫМ свечам заданного таймфрейма."""
+    """Считает три индикатора по ЗАКРЫТЫМ свечам заданного таймфрейма.
+
+    Математика детекторов и пороги НЕ ИЗМЕНЕНЫ. Изменился только выход:
+    три детектора больше не шлют три отдельных сообщения — они собираются
+    в один итоговый торговый сигнал.
+    """
     try:
         data = await fetch_klines(client, symbol, timeframe, limit, cache_ttl)
     except Exception as e:
@@ -429,58 +562,98 @@ async def scan_technical(client: httpx.AsyncClient, symbol: str, timeframe: str,
     except Exception as e:
         logger.error("statistics: resolve_open_signals failed for %s %s: %s", symbol, timeframe, e)
 
-    # ── Breakout ─────────────────────────────────────────────────────────────
-    bo = ts.detect_breakout(highs, lows, closes, n=config.DONCHIAN_LOOKBACK)
-    sent_breakout = False
-    if bo:
-        direction = "LONG" if bo["direction"] == "bullish" else "SHORT"
-        sent_breakout = await _emit(
-            client, symbol, timeframe, "breakout", direction,
-            lambda cp: tg.fmt_breakout_alert(symbol, bo["direction"], bo["level"],
-                                              bo["price"], bo["n"], timeframe, cp),
-            signal_price=bo["price"], entry_level=bo["level"],
-            fast_n=config.DONCHIAN_LOOKBACK, candle_close_ts=candle_close_ts,
-            strong=True, highs=highs, lows=lows, closes=closes,
-        )
+    # Закрылась ли активная сделка по этому символу
+    try:
+        await _check_trade_close(symbol, timeframe, highs, lows, data["close_times"])
+    except Exception as e:
+        logger.error("trade_state: проверка закрытия не удалась (%s %s): %s", symbol, timeframe, e)
 
-    # ── Turtle Zone Filter ───────────────────────────────────────────────────
+    # ── Детекторы (математика без изменений) ─────────────────────────────────
+    hits = []
+
+    bo = ts.detect_breakout(highs, lows, closes, n=config.DONCHIAN_LOOKBACK)
+    if bo:
+        hits.append({
+            "setup": "breakout",
+            "direction": "LONG" if bo["direction"] == "bullish" else "SHORT",
+            "price": bo["price"], "level": bo["level"], "fast_n": config.DONCHIAN_LOOKBACK,
+        })
+
     tzone = ts.detect_turtle_zone(
         highs, lows, closes,
         fast=config.TURTLE_FAST_LOOKBACK, slow=config.TURTLE_SLOW_LOOKBACK,
     )
     if tzone:
-        direction = "LONG" if tzone["direction"] == "bullish" else "SHORT"
-        # Комбо: оба детектора сработали на одной свече в одну сторону, и
-        # Breakout уже реально ушёл в Telegram — пишем в статистику как один
-        # combo-сетап вместо двух строк (см. DECISIONS.md #12).
-        setup = ("breakout_turtle_combo"
-                 if (sent_breakout and bo and direction ==
-                     ("LONG" if bo["direction"] == "bullish" else "SHORT"))
-                 else "turtle_zone")
-        await _emit(
-            client, symbol, timeframe, setup, direction,
-            lambda cp: tg.fmt_turtle_zone_alert(symbol, tzone["direction"], tzone["stage"],
-                                                 tzone["fast_level"], tzone["slow_level"],
-                                                 tzone["price"], timeframe, cp),
-            signal_price=tzone["price"], entry_level=tzone["fast_level"],
-            fast_n=config.TURTLE_FAST_LOOKBACK, candle_close_ts=candle_close_ts,
-            strong=(tzone["stage"] == "confirmed"), highs=highs, lows=lows, closes=closes,
-        )
+        hits.append({
+            "setup": "turtle_zone",
+            "direction": "LONG" if tzone["direction"] == "bullish" else "SHORT",
+            "price": tzone["price"], "level": tzone["fast_level"],
+            "fast_n": config.TURTLE_FAST_LOOKBACK,
+        })
 
-    # ── Failure Test ─────────────────────────────────────────────────────────
     ft = ts.detect_failure_test(
         highs, lows, closes,
         n=config.DONCHIAN_LOOKBACK, lookback=config.FAILURE_TEST_LOOKBACK,
     )
     if ft:
-        await _emit(
-            client, symbol, timeframe, "failure_test", ft["direction"],
-            lambda cp: tg.fmt_failure_test_alert(symbol, ft["direction"], ft["level"],
-                                                  ft["price"], timeframe, cp),
-            signal_price=ft["price"], entry_level=ft["level"],
-            fast_n=config.DONCHIAN_LOOKBACK, candle_close_ts=candle_close_ts,
-            strong=True, highs=highs, lows=lows, closes=closes,
+        hits.append({
+            "setup": "failure_test", "direction": ft["direction"],
+            "price": ft["price"], "level": ft["level"], "fast_n": config.DONCHIAN_LOOKBACK,
+        })
+
+    if not hits:
+        return
+
+    # ── Дедуп по свече ───────────────────────────────────────────────────────
+    fresh = [h for h in hits
+             if _is_new_candle_signal(symbol, timeframe, h["setup"], h["direction"], candle_close_ts)]
+    if not fresh:
+        return
+
+    # Контекст 4H/1D — по-прежнему считается и пишется в Neon. Из сообщения
+    # убран только показ; сами расчёты и колонки не тронуты.
+    ctx = await fetch_trend_context(client, symbol)
+
+    # ── Запись в статистику: КАЖДЫЙ сработавший детектор ─────────────────────
+    setups_fired = {h["setup"] for h in fresh}
+    for h in fresh:
+        setup = h["setup"]
+        # Комбо-обозначение сохранено из прежней логики (DECISIONS.md #12):
+        # Breakout и Turtle Zone на одной свече в одну сторону = один сетап.
+        if setup == "turtle_zone" and "breakout" in setups_fired:
+            bo_dir = next(x["direction"] for x in fresh if x["setup"] == "breakout")
+            if bo_dir == h["direction"]:
+                setup = "breakout_turtle_combo"
+        await _record_detector(
+            client, symbol, timeframe, setup, h["direction"],
+            h["price"], h["level"], h["fast_n"], candle_close_ts,
+            highs, lows, closes, ctx,
         )
+
+    # ── Один итоговый торговый сигнал ────────────────────────────────────────
+    if not config.TRADE_SIGNALS_ONLY:
+        return
+
+    directions = {h["direction"] for h in fresh}
+    if len(directions) > 1:
+        logger.info("trade_state: %s %s — детекторы противоречат (%s), в Telegram ничего",
+                    symbol, timeframe, ", ".join(sorted(directions)))
+        return
+
+    by_priority = sorted(
+        fresh,
+        key=lambda h: trade_state.SETUP_PRIORITY.index(h["setup"])
+        if h["setup"] in trade_state.SETUP_PRIORITY else 99,
+    )
+    lead = by_priority[0]
+    # Turtle Zone структурного уровня не даёт — для него стоп плоский.
+    level = None if lead["setup"] == "turtle_zone" else lead["level"]
+
+    await _send_trade_signal(
+        symbol=symbol, timeframe=timeframe, direction=lead["direction"],
+        setups=[h["setup"] for h in by_priority], entry=lead["price"],
+        level=level, highs=highs, lows=lows, candle_close_ts=candle_close_ts,
+    )
 
 
 async def scan_all_technical(client: httpx.AsyncClient):
@@ -597,6 +770,10 @@ async def run_loop():
         f"Alerts: only on significant signals\n"
         f"Started: {_now_utc()}"
     )
+
+    # Восстановление активных сделок после перезапуска Render — до первого
+    # скана, иначе бот повторно отправит сигналы по уже открытым позициям.
+    await restore_open_trades()
 
     async with httpx.AsyncClient(
         timeout=12,

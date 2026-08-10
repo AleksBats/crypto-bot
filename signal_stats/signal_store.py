@@ -88,6 +88,40 @@ ALTER TABLE signals ADD COLUMN IF NOT EXISTS trendline_slope DOUBLE PRECISION;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS trendline_anchor_ts BIGINT;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS trendline_anchor_price DOUBLE PRECISION;
 CREATE INDEX IF NOT EXISTS idx_signals_alignment ON signals (alignment);
+
+-- ── active_trades ────────────────────────────────────────────────────────
+-- Слой ПОКАЗА, отдельный от таблицы signals. Здесь живёт только вопрос
+-- "занят ли символ открытой сделкой" и уровни, которые реально ушли в
+-- Telegram. Таблица signals и правило WIN/LOSS не затрагиваются.
+-- Миграция идемпотентная: существующие данные не читаются и не меняются.
+CREATE TABLE IF NOT EXISTS active_trades (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    opened_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    symbol            TEXT NOT NULL,
+    timeframe         TEXT NOT NULL,
+    direction         TEXT NOT NULL,
+    setup             TEXT NOT NULL,
+    entry             DOUBLE PRECISION NOT NULL,
+    stop              DOUBLE PRECISION NOT NULL,
+    target_mmo        DOUBLE PRECISION,
+    target_1r         DOUBLE PRECISION,
+    target_primary    DOUBLE PRECISION,
+    risk_pct          DOUBLE PRECISION,
+    notional          DOUBLE PRECISION,
+    margin            DOUBLE PRECISION,
+    risk_usd          DOUBLE PRECISION,
+    candle_close_ts   BIGINT,
+    signal_id         UUID,
+    status            TEXT NOT NULL DEFAULT 'OPEN',
+    closed_at         TIMESTAMPTZ,
+    closed_price      DOUBLE PRECISION,
+    closed_ts         BIGINT,
+    close_reason      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_active_trades_status ON active_trades (status);
+CREATE INDEX IF NOT EXISTS idx_active_trades_opened_at ON active_trades (opened_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_active_trades_one_per_symbol
+    ON active_trades (symbol) WHERE status = 'OPEN';
 """
 
 
@@ -237,3 +271,116 @@ async def get_first_signal_at() -> Optional[datetime]:
         return None
     val = await pool.fetchval("SELECT MIN(fired_at) FROM signals")
     return val
+
+
+# ── active_trades (Telegram output layer) ────────────────────────────────────
+# Отдельно от статистики: эти функции не читают и не пишут таблицу signals.
+
+async def insert_trade_candidate(
+    symbol: str, timeframe: str, direction: str, setup: str,
+    entry: float, stop: float, target_mmo, target_1r, target_primary,
+    risk_pct, notional, margin, risk_usd, candle_close_ts,
+    status: str = "OPEN",
+) -> Optional[str]:
+    """Сохраняет кандидата на сделку. Возвращает id или None (нет БД / уже открыт).
+
+    status="OPEN"             — сделка реально отправлена, символ занят.
+    status="SKIPPED_CAPACITY" — были заняты все слоты (MAX_ACTIVE_TRADES).
+    status="SKIPPED_SYMBOL_OPEN" / "SKIPPED_COOLDOWN" — прочие блокировки.
+
+    Пропущенные кандидаты пишутся с полностью посчитанными уровнями, чтобы
+    потом можно было объективно оценить стоимость лимита, а не гадать.
+    Уникальный частичный индекс действует только на status='OPEN', поэтому
+    SKIPPED-строк по одному символу может быть сколько угодно.
+
+    Гонку ловит тот же индекс: ON CONFLICT DO NOTHING отдаёт None, если по
+    символу уже есть OPEN, — гейт не сломается, даже если два таймфрейма
+    сработают в один момент."""
+    pool = await get_pool()
+    if pool is None:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO active_trades (
+                    symbol, timeframe, direction, setup,
+                    entry, stop, target_mmo, target_1r, target_primary,
+                    risk_pct, notional, margin, risk_usd, candle_close_ts, status
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                ON CONFLICT DO NOTHING
+                RETURNING id
+                """,
+                symbol, timeframe, direction, setup,
+                entry, stop, target_mmo, target_1r, target_primary,
+                risk_pct, notional, margin, risk_usd, candle_close_ts, status,
+            )
+        return str(row["id"]) if row else None
+    except Exception as e:
+        logger.error("statistics: insert_trade_candidate failed (%s): %s", symbol, e)
+        return None
+
+
+async def get_open_trades() -> list[dict]:
+    """Все открытые сделки — вызывается один раз при старте для восстановления
+    состояния после перезапуска Render."""
+    pool = await get_pool()
+    if pool is None:
+        return []
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM active_trades WHERE status = 'OPEN' ORDER BY opened_at"
+            )
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error("statistics: get_open_trades failed: %s", e)
+        return []
+
+
+async def close_active_trade(trade_id: str, reason: str, price: float, closed_ts: int) -> bool:
+    """TARGET_HIT / STOP_HIT. Освобождает символ."""
+    pool = await get_pool()
+    if pool is None:
+        return False
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE active_trades
+                   SET status = $2, close_reason = $2, closed_price = $3,
+                       closed_ts = $4, closed_at = now()
+                 WHERE id = $1::uuid AND status = 'OPEN'
+                """,
+                trade_id, reason, price, closed_ts,
+            )
+        return True
+    except Exception as e:
+        logger.error("statistics: close_active_trade failed (%s): %s", trade_id, e)
+        return False
+
+
+async def get_skipped_candidates(since: Optional[datetime] = None) -> list[dict]:
+    """Кандидаты, не отправленные из-за лимита слотов или занятого символа.
+
+    Нужны, чтобы можно было честно посчитать цену ограничения
+    MAX_ACTIVE_TRADES: сколько сигналов мы пропустили и куда бы они пошли."""
+    pool = await get_pool()
+    if pool is None:
+        return []
+    try:
+        async with pool.acquire() as conn:
+            if since is None:
+                rows = await conn.fetch(
+                    "SELECT * FROM active_trades WHERE status LIKE 'SKIPPED%' "
+                    "ORDER BY opened_at DESC"
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT * FROM active_trades WHERE status LIKE 'SKIPPED%' "
+                    "AND opened_at >= $1 ORDER BY opened_at DESC", since,
+                )
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error("statistics: get_skipped_candidates failed: %s", e)
+        return []

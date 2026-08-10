@@ -84,3 +84,33 @@ Full spec-driven build: persistent WIN/LOSS/OPEN tracking with R-multiples, MFE/
 - Original `AleksBats/crypto-bot` repo already contained a working ASTER-monitoring bot (`run_live.py`, `alert_engine.py`, `telegram_bot.py`, `config.py`, `state.py`) sending Telegram alerts for volume spikes, open-interest changes, and extreme funding rate on ASTERUSDT via Binance's public API.
 - Several disabled/unwired monitor stubs also existed in the repo (`price.py`, `whale.py`, `funding.py`, `open_interest.py`, `volume.py`, `twitter.py`) — never imported by `run_live.py`, not part of the live pipeline.
 - An unrelated bot (`crypto_bot.py`, "Crypto Signal Bot" — 6-hourly BTC analysis via Claude AI + CoinGecko + Fear & Greed + Reddit + CryptoPanic) also lived in the same repo and in the user's local `crypto_bot_project 2` folder. Not deployed, not related to this project.
+
+## 2026-08-10 — Telegram output layer: один торговый сигнал вместо потока детекторов
+
+**Причина:** утром пришло 104 сообщения (raw detector messages + блок контекста).
+Аудит показал, что согласованные накануне изменения никогда не были написаны —
+на Render работал `99fbad5`, последний коммит репозитория.
+
+**Убрано из Telegram:** отдельные Breakout / Turtle Zone / Failure Test
+сообщения, MULTIPLE SIGNALS, блок КОНТЕКСТ (1D тренд, 4H тренд, 4H структура,
+Alignment), повторы по открытой сделке.
+
+**Добавлено:** единый формат с Entry / Stop / Target1 / Target2 / риском в % и
+блоком ПОЗИЦИЯ (объём, маржа при 5x, риск в долларах) — формулы перенесены из
+локального бота пользователя без изменений. Гейт «одна сделка на символ» с
+восстановлением состояния из Neon после рестарта Render. `MAX_OPEN_SIGNALS=3`.
+
+**Не изменено:** математика индикаторов, пороги, список монет, расчёты 4H/1D
+контекста (продолжают писаться в Neon), правило WIN/LOSS, агрегации отчётов.
+
+**Новое:** `trade_state.py`, `test_trade_state.py` (74 проверки), таблица
+`active_trades` в Neon (идемпотентная миграция).
+
+**Откат:** `TRADE_SIGNALS_ONLY=false`.
+
+**Уточнение по лимиту (то же изменение):** переменная называется
+`MAX_ACTIVE_TRADES` (было `MAX_OPEN_SIGNALS`), лимит глобальный — 3 сделки по
+всем символам сразу. Непрошедшие кандидаты сохраняются в Neon со статусами
+`SKIPPED_CAPACITY` / `SKIPPED_SYMBOL_OPEN` / `SKIPPED_COOLDOWN` вместе с
+посчитанными уровнями. Слот освобождается только по TARGET HIT / STOP HIT;
+открытые сделки не вытесняются.

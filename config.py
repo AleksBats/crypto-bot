@@ -69,6 +69,47 @@ POLL_HOURLY_SECS      = int(os.environ.get("POLL_HOURLY_SECS", "300"))     # 5 �
 # только описывает контекст рынка и копится в статистику. Индикаторы
 # Breakout / Turtle Zone / Failure Test и их параметры не затронуты.
 # См. DECISIONS.md #14.
+# ══════════════════════════════════════════════════════════════════════════
+# TELEGRAM OUTPUT LAYER — position sizing / trade signal presentation
+# ══════════════════════════════════════════════════════════════════════════
+# Эти константы НЕ влияют на индикаторы, пороги срабатывания и статистику.
+# Они управляют только тем, как уже сработавший сигнал показывается в Telegram
+# и когда символ считается "занятым" открытой сделкой.
+#
+# Fixed-fractional sizing (перенесено 1:1 из локального бота, формулы не менялись):
+#   risk_usd = ACCOUNT_SIZE * RISK_PCT           -> $1000 * 0.02 = $20
+#   notional = min(risk_usd / stop_dist, ACCOUNT_SIZE * LEVERAGE)
+#   margin   = notional / LEVERAGE
+# Широкий стоп сам уменьшает позицию, узкий — увеличивает; потеря на стопе
+# всегда равна risk_usd, пока не упёрлись в потолок плеча.
+ACCOUNT_SIZE = float(os.environ.get("ACCOUNT_SIZE", "1000"))   # депозит в USDT
+RISK_PCT     = float(os.environ.get("RISK_PCT",     "0.02"))   # доля депозита на сделку
+LEVERAGE     = float(os.environ.get("LEVERAGE",     "5"))      # плечо; потолок номинала
+
+# Стоп ставится чуть ВНУТРЬ пробитого уровня: если цена вернулась в диапазон,
+# идея пробоя не сработала. 0.003 = 0.3% — значение из локального бота.
+STOP_BUFFER_PCT = float(os.environ.get("STOP_BUFFER_PCT", "0.003"))
+
+# Turtle Zone даёт только направление, без структурного уровня — для него
+# используется плоский стоп, иначе позицию не посчитать. Тоже из локального бота.
+DEFAULT_STOP_PCT = float(os.environ.get("DEFAULT_STOP_PCT", "0.02"))
+
+# ГЛОБАЛЬНЫЙ лимит одновременно открытых сделок по всем символам сразу.
+# Правила управления торговлей (не математика индикаторов):
+#   - максимум MAX_ACTIVE_TRADES открытых сделок одновременно;
+#   - максимум 1 открытая сделка на символ;
+#   - при исчерпании лимита новые сигналы в Telegram НЕ уходят, но и НЕ
+#     теряются: кандидат пишется в active_trades со статусом SKIPPED_CAPACITY;
+#   - слот освобождается только по TARGET HIT / STOP HIT;
+#   - существующие сделки НИКОГДА не закрываются ради нового сигнала и
+#     не заменяются "более удачным" кандидатом.
+MAX_ACTIVE_TRADES = int(os.environ.get("MAX_ACTIVE_TRADES", "3"))
+
+# Аварийный выключатель. false = вернуться к старому поведению (raw detector
+# messages + блок КОНТЕКСТА). Нужен, чтобы откатить presentation layer одной
+# переменной окружения, без redeploy и без git revert.
+TRADE_SIGNALS_ONLY = os.environ.get("TRADE_SIGNALS_ONLY", "true").lower() != "false"
+
 ENABLE_TREND_CONTEXT = os.environ.get("ENABLE_TREND_CONTEXT", "true").lower() in ("1", "true", "yes")
 
 # Окно подтверждения swing point: N свечей слева И справа. Единственное

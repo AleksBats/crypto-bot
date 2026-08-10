@@ -253,3 +253,90 @@ def fmt_stats_summary(overall: dict, by_type: dict) -> str:
         "See DECISIONS.md #11.</i>"
     )
     return "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ЕДИНЫЙ ТОРГОВЫЙ СИГНАЛ (Telegram output layer)
+# ════════════════════════════════════════════════════════════════════════════
+# Всё, что выше — форматтеры отдельных детекторов и блок КОНТЕКСТА. Они
+# СОЗНАТЕЛЬНО оставлены в файле, но больше НЕ ВЫЗЫВАЮТСЯ из run_live.py:
+# Telegram получает только fmt_trade_signal(). Расчёты 1D/4H контекста
+# продолжают работать и писаться в Neon — из сообщения убрано только
+# отображение. Аварийный откат — переменной TRADE_SIGNALS_ONLY=false.
+
+def _px(value: float) -> str:
+    """Разрядность под цену: PEPE и BTC не могут печататься одинаково."""
+    if value is None:
+        return "—"
+    a = abs(value)
+    if a < 0.001:
+        return f"{value:,.8f}"
+    if a < 1:
+        return f"{value:,.6f}"
+    return f"{value:,.4f}"
+
+
+def fmt_position_block(pos: dict) -> str:
+    """Порт fmt_position_block() из локального бота пользователя.
+    Числа приходят готовыми из trade_state.position_size()."""
+    if not pos:
+        return ""
+    lines = [
+        "",
+        "💰 <b>ПОЗИЦИЯ</b>",
+        f"Объём:  <b>{pos['qty']:,.4f}</b>  (~${pos['notional']:,.0f} номинал)",
+        f"Маржа:  <b>${pos['margin']:,.0f}</b>  при {pos['leverage']:.0f}x",
+        f"Риск:   <b>${pos['risk_usd']:,.2f}</b> "
+        f"({pos['risk_pct_of_account']:.2f}% от ${pos['account_size']:,.0f})",
+    ]
+    if pos.get("capped"):
+        lines.append(
+            f"⚠️ Урезано плечом {pos['leverage']:.0f}x — стоп слишком узкий "
+            f"для полного риска"
+        )
+    return "\n".join(lines)
+
+
+def fmt_trade_signal(symbol: str, timeframe: str, levels: dict, pos: dict,
+                     setup_label: str) -> str:
+    """ЕДИНСТВЕННОЕ сообщение, которое уходит по техническому сигналу."""
+    is_long = levels["direction"] == "LONG"
+    emoji = "🟢" if is_long else "🔴"
+    tf = timeframe.upper()
+
+    lines = [
+        f"{emoji} <b>{levels['direction']} — {symbol}</b> ({tf})",
+        f"Setup: {setup_label}",
+        "",
+        f"Entry:   <b>${_px(levels['entry'])}</b>",
+        f"Stop:    ${_px(levels['stop'])}  ({levels['risk_pct']:.2f}%)",
+    ]
+
+    targets = []
+    if levels.get("target_mmo") is not None:
+        targets.append((levels["target_mmo"], "MMO"))
+    if levels.get("target_1r") is not None:
+        targets.append((levels["target_1r"], "1R"))
+    # Ближняя цель первой — она же закрывает сделку (trade_state.primary_target)
+    targets.sort(key=lambda t: abs(t[0] - levels["entry"]))
+    for i, (price, tag) in enumerate(targets, start=1):
+        lines.append(f"Target{i}: ${_px(price)}  ({tag})")
+
+    return "\n".join(lines) + fmt_position_block(pos)
+
+
+def fmt_trade_closed(symbol: str, timeframe: str, direction: str, setup: str,
+                     reason: str, price: float, entry: float) -> str:
+    """Короткое уведомление о закрытии — символ снова свободен."""
+    win = reason == "TARGET_HIT"
+    emoji = "✅" if win else "🛑"
+    title = "TARGET HIT" if win else "STOP HIT"
+    if direction.upper() == "LONG":
+        pnl_pct = (price - entry) / entry * 100
+    else:
+        pnl_pct = (entry - price) / entry * 100
+    return (
+        f"{emoji} <b>{title} — {symbol}</b> ({timeframe.upper()})\n"
+        f"{direction} {setup}\n"
+        f"Вход ${_px(entry)} → выход ${_px(price)}  ({pnl_pct:+.2f}%)"
+    )

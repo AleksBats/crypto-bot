@@ -71,6 +71,13 @@ class AlertEngine:
                 if signal.key not in existing_keys:
                     self._pending_weak.append(signal)
 
+                # MULTIPLE SIGNALS отключён в режиме торговых сигналов:
+                # Telegram должен получать только конечный actionable сигнал.
+                # Слабые сигналы по-прежнему копятся и могут быть подхвачены
+                # сильным алертом, но самостоятельным сообщением не становятся.
+                if getattr(config, "TRADE_SIGNALS_ONLY", False):
+                    return False
+
                 if len(self._pending_weak) >= 2:
                     await self._send_combo()
                     return True
