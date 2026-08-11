@@ -299,6 +299,15 @@ class Handler(BaseHTTPRequestHandler):
             state = ", ".join(f"{s}:{t['indicator']}" for s, t in sorted(_open.items()))
         self._reply(200, f"alive | открыто {len(_open)}: {state or '—'}")
 
+    def do_HEAD(self):
+        # UptimeRobot по умолчанию проверяет методом HEAD. Без этого метода
+        # BaseHTTPRequestHandler отвечает 501, и монитор считает сервис
+        # упавшим — хотя запрос доходит и сервис от сна просыпается.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self):
         try:
             length = int(self.headers.get("Content-Length", 0))
