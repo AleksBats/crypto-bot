@@ -12,14 +12,20 @@ webhook_relay.py — принимает алерты трёх индикатор
 Каждый индикатор ведёт СВОЮ сделку и шлёт два события: `entry` при входе и
 `exit` с результатом WIN/LOSS при срабатывании стопа или цели. Сервер:
 
-  entry  -> символ свободен?  да: открываем и пишем в Telegram
+  entry  -> пара (индикатор, символ) свободна?
+                              да: открываем и пишем в Telegram
                               нет: молча игнорируем
-  exit   -> открытая сделка по символу от ЭТОГО индикатора?
+  exit   -> есть открытая сделка по этой же паре?
                               да: закрываем и пишем WIN/LOSS
-                              нет: игнорируем — значит его вход мы не пропускали
+                              нет: игнорируем
 
-Так поток сообщений ровно такой, как просили: сигнал -> ждём -> результат.
-Ни одного повторного сообщения по монете, пока сделка не отработала.
+КЛЮЧ СОСТОЯНИЯ — ПАРА (индикатор, символ), а не символ.
+Раньше ключом был только символ, и по BTCUSDT могла жить одна сделка на всех.
+Это ломало статистику: Grimes Связка 1 и Связка 2 — независимые системы и
+обе могут быть активны по одной монете одновременно, как и Pullback с Turtle.
+Теперь каждый индикатор ведёт свою виртуальную сделку по каждой монете.
+Повтор запрещён только внутри одной пары: второй Pullback по BTCUSDT не
+пройдёт, пока первый не закрылся, но Turtle по BTCUSDT пройдёт свободно.
 
 ХРАНЕНИЕ. Состояние лежит в Neon (та же база, что у статистики бота, но в
 отдельной таблице relay_trades). Render на бесплатном тарифе усыпляет сервис
@@ -70,7 +76,7 @@ LEVERAGE = float(os.environ.get("LEVERAGE", "5"))
 MAX_BODY = 8 * 1024
 
 _lock = threading.Lock()      # запросы приходят в потоках, состояние общее
-_open: dict = {}              # symbol -> сделка (зеркало базы)
+_open: dict = {}              # (indicator, symbol) -> сделка (зеркало базы)
 _score: dict = {}             # indicator -> [wins, losses]
 
 
@@ -92,8 +98,13 @@ CREATE TABLE IF NOT EXISTS relay_trades (
     opened_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     closed_at   TIMESTAMPTZ
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_one_open_per_symbol
-    ON relay_trades (symbol) WHERE status = 'OPEN';
+-- Миграция ключа уникальности: раньше одна OPEN-сделка на символ,
+-- теперь одна OPEN-сделка на пару (индикатор, символ).
+-- DROP INDEX не трогает строки: индекс это служебная структура, а не данные.
+-- Переход от строгого ограничения к более мягкому нарушить ничего не может.
+DROP INDEX IF EXISTS idx_relay_one_open_per_symbol;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_one_open_per_indicator_symbol
+    ON relay_trades (indicator, symbol) WHERE status = 'OPEN';
 CREATE INDEX IF NOT EXISTS idx_relay_status ON relay_trades (status);
 """
 
@@ -133,15 +144,16 @@ def db_init():
     rows = db_exec("SELECT symbol, indicator, tf, direction, entry, stop, target "
                    "FROM relay_trades WHERE status = 'OPEN'", fetch=True) or []
     for r in rows:
-        _open[r[0]] = {"symbol": r[0], "indicator": r[1], "tf": r[2],
-                       "dir": r[3], "entry": r[4], "stop": r[5], "target": r[6]}
+        _open[(r[1], r[0])] = {"symbol": r[0], "indicator": r[1], "tf": r[2],
+                               "dir": r[3], "entry": r[4], "stop": r[5], "target": r[6]}
     rows = db_exec("SELECT indicator, status, count(*) FROM relay_trades "
                    "WHERE status IN ('WIN','LOSS') GROUP BY 1,2", fetch=True) or []
     for ind, st, n in rows:
         _score.setdefault(ind, [0, 0])
         _score[ind][0 if st == "WIN" else 1] += n
     logger.info("Восстановлено из базы: %d открытых сделок (%s)",
-                len(_open), ", ".join(sorted(_open)) or "—")
+                len(_open),
+                ", ".join(f"{sym}:{ind}" for ind, sym in sorted(_open)) or "—")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -232,15 +244,19 @@ def fmt_exit(t: dict, result: str) -> str:
 
 def handle_entry(d: dict) -> str:
     symbol = d.get("symbol", "")
+    indicator = d.get("indicator", "")
+    key = (indicator, symbol)
     with _lock:
-        busy = _open.get(symbol)
+        # Занятость проверяется только внутри своей пары. Сделка другого
+        # индикатора по этой же монете не мешает — они независимы.
+        busy = _open.get(key)
         if busy:
-            logger.info("Вход %s от %s пропущен — уже открыта сделка от %s",
-                        symbol, d.get("indicator"), busy["indicator"])
-            return "symbol busy"
+            logger.info("Вход %s от %s пропущен — эта пара уже открыта (%s)",
+                        symbol, indicator, busy["dir"])
+            return "duplicate active trade"
         trade = {k: d.get(k) for k in ("symbol", "indicator", "tf", "dir",
                                         "entry", "stop", "target", "mmo")}
-        _open[symbol] = trade
+        _open[key] = trade
 
     db_exec("INSERT INTO relay_trades (symbol, indicator, tf, direction, entry, stop, target) "
             "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
@@ -259,21 +275,22 @@ def handle_exit(d: dict) -> str:
     if result not in ("WIN", "LOSS"):
         return "bad result"
 
+    key = (indicator, symbol)
     with _lock:
-        trade = _open.get(symbol)
+        # Ищем строго свою пару. Выход одного индикатора физически не может
+        # закрыть сделку другого: ключи разные.
+        trade = _open.get(key)
         if not trade:
-            logger.info("Выход %s от %s пропущен — открытой сделки нет", symbol, indicator)
+            logger.info("Выход %s от %s пропущен — по этой паре открытой сделки нет",
+                        symbol, indicator)
             return "no open trade"
-        if trade["indicator"] != indicator:
-            logger.info("Выход %s от %s пропущен — сделку открывал %s",
-                        symbol, indicator, trade["indicator"])
-            return "other indicator"
-        del _open[symbol]
+        del _open[key]
         _score.setdefault(indicator, [0, 0])
         _score[indicator][0 if result == "WIN" else 1] += 1
 
     db_exec("UPDATE relay_trades SET status = %s, closed_at = now() "
-            "WHERE symbol = %s AND status = 'OPEN'", (result, symbol))
+            "WHERE symbol = %s AND indicator = %s AND status = 'OPEN'",
+            (result, symbol, indicator))
 
     send_telegram(fmt_exit(trade, result))
     logger.info("ЗАКРЫТА %s %s -> %s", symbol, indicator, result)
@@ -296,7 +313,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         # Health-check для Render и пинга UptimeRobot; заодно видно состояние.
         with _lock:
-            state = ", ".join(f"{s}:{t['indicator']}" for s, t in sorted(_open.items()))
+            state = ", ".join(f"{sym}:{ind}" for ind, sym in sorted(_open))
         self._reply(200, f"alive | открыто {len(_open)}: {state or '—'}")
 
     def do_HEAD(self):
