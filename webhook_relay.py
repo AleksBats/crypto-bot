@@ -106,6 +106,26 @@ DROP INDEX IF EXISTS idx_relay_one_open_per_symbol;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_one_open_per_indicator_symbol
     ON relay_trades (indicator, symbol) WHERE status = 'OPEN';
 CREATE INDEX IF NOT EXISTS idx_relay_status ON relay_trades (status);
+
+-- Осиротевшие выходы. Индикатор в TradingView считает сделку открытой, а
+-- релей о ней не знает: вебхук со входом не дошёл (сервис спал, шёл деплой,
+-- TradingView не повторяет доставку). Раньше такой выход выбрасывался молча
+-- и сделка исчезала из статистики бесследно.
+--
+-- Отдельная таблица, а не строка в relay_trades: подтверждённого входа нет,
+-- цен нет, в win rate такое событие попасть не должно ни при каких запросах.
+-- Здесь оно нужно ровно для одного — знать, сколько сделок потерял транспорт.
+CREATE TABLE IF NOT EXISTS relay_orphan_exits (
+    id          BIGSERIAL PRIMARY KEY,
+    symbol      TEXT NOT NULL,
+    indicator   TEXT NOT NULL,
+    tf          TEXT,
+    direction   TEXT,
+    result      TEXT NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_relay_orphan_indicator
+    ON relay_orphan_exits (indicator);
 """
 
 
@@ -121,13 +141,19 @@ def _connect():
 
 
 def db_exec(sql: str, args: tuple = (), fetch: bool = False):
+    """Возвращает список строк при fetch, True при успешной записи, None при ошибке.
+
+    Раньше успешная запись и упавшая запись возвращали одно и то же — None,
+    и вызывающий код не мог их различить. Из-за этого сделка попадала в
+    Telegram даже когда INSERT не прошёл. Теперь неудача отличима.
+    """
     conn = _connect()
     if conn is None:
         return None
     try:
         with conn, conn.cursor() as cur:
             cur.execute(sql, args)
-            return cur.fetchall() if fetch else None
+            return cur.fetchall() if fetch else True
     except Exception as e:
         logger.error("Ошибка запроса к базе: %s", e)
         return None
@@ -146,8 +172,12 @@ def db_init():
     for r in rows:
         _open[(r[1], r[0])] = {"symbol": r[0], "indicator": r[1], "tf": r[2],
                                "dir": r[3], "entry": r[4], "stop": r[5], "target": r[6]}
+    # В счёт идут только состоявшиеся сделки: OPEN ещё не имеет исхода,
+    # осиротевшие выходы лежат в другой таблице и сюда попасть не могут,
+    # а служебные прогоны отсекаются по имени индикатора.
     rows = db_exec("SELECT indicator, status, count(*) FROM relay_trades "
-                   "WHERE status IN ('WIN','LOSS') GROUP BY 1,2", fetch=True) or []
+                   "WHERE status IN ('WIN','LOSS') AND indicator NOT LIKE 'TEST%%' "
+                   "GROUP BY 1,2", fetch=True) or []
     for ind, st, n in rows:
         _score.setdefault(ind, [0, 0])
         _score[ind][0 if st == "WIN" else 1] += n
@@ -217,6 +247,14 @@ def fmt_entry(t: dict) -> str:
     return "\n".join(head)
 
 
+def fmt_tech(text: str) -> str:
+    """Техническое предупреждение. Намеренно не похоже на торговый сигнал:
+    ни направления, ни цен, ни блока позиции — чтобы его нельзя было принять
+    за сделку и по нему нельзя было ничего открыть."""
+    return ("⚠️ <b>СБОЙ СИСТЕМЫ</b>\n"
+            "<i>Техническое сообщение, не торговый сигнал.</i>\n\n" + text)
+
+
 def fmt_exit(t: dict, result: str) -> str:
     win = result == "WIN"
     entry = float(t["entry"]) if t.get("entry") else None
@@ -256,14 +294,47 @@ def handle_entry(d: dict) -> str:
             return "duplicate active trade"
         trade = {k: d.get(k) for k in ("symbol", "indicator", "tf", "dir",
                                         "entry", "stop", "target", "mmo")}
+        # Бронь под замком: она же защита от дубля. Если запись в базу не
+        # пройдёт, бронь снимается ниже — иначе пара осталась бы навсегда
+        # занятой сделкой, которой нигде нет.
         _open[key] = trade
 
-    db_exec("INSERT INTO relay_trades (symbol, indicator, tf, direction, entry, stop, target) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+    # Вход считается зарегистрированным только после успешной записи в Neon.
+    # Раньше INSERT мог упасть, а сообщение всё равно уходило: в Telegram
+    # сделка есть, в базе её нет, после рестарта Render она исчезает вместе
+    # со своим будущим результатом. RETURNING id отличает реальную вставку от
+    # конфликта: пустой ответ значит, что открытая сделка по этой паре в базе
+    # уже есть, то есть память и база разошлись, и это тоже дубль.
+    if DATABASE_URL:
+        rows = db_exec(
+            "INSERT INTO relay_trades (symbol, indicator, tf, direction, entry, stop, target) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING id",
             (symbol, trade["indicator"], trade["tf"], trade["dir"],
-             trade["entry"], trade["stop"], trade["target"]))
+             trade["entry"], trade["stop"], trade["target"]), fetch=True)
 
-    send_telegram(fmt_entry(trade))
+        if rows is None:
+            with _lock:
+                _open.pop(key, None)
+            logger.error("DATABASE WRITE FAILED — вход %s от %s не записан в базу, "
+                         "сделка НЕ открыта", symbol, indicator)
+            send_telegram(fmt_tech(
+                f"Сигнал <b>{indicator}</b> по <b>{symbol}</b> не записан в базу.\n"
+                f"Сделка не открыта и в статистику не попадёт."))
+            return "database write failed"
+
+        if not rows:
+            with _lock:
+                _open.pop(key, None)
+            logger.info("Вход %s от %s пропущен — в базе уже есть открытая "
+                        "сделка по этой паре", symbol, indicator)
+            return "duplicate active trade"
+
+    if not send_telegram(fmt_entry(trade)):
+        # Сделку не откатываем: вход уже зарегистрирован в базе и его результат
+        # будет учтён. Потеряно только уведомление.
+        logger.error("TELEGRAM DELIVERY FAILED — вход %s от %s записан в базу, "
+                     "но сообщение не доставлено", symbol, indicator)
+
     logger.info("ОТКРЫТА %s %s от %s", symbol, trade["dir"], trade["indicator"])
     return "opened"
 
@@ -280,21 +351,57 @@ def handle_exit(d: dict) -> str:
         # Ищем строго свою пару. Выход одного индикатора физически не может
         # закрыть сделку другого: ключи разные.
         trade = _open.get(key)
-        if not trade:
-            logger.info("Выход %s от %s пропущен — по этой паре открытой сделки нет",
-                        symbol, indicator)
-            return "no open trade"
-        del _open[key]
-        _score.setdefault(indicator, [0, 0])
-        _score[indicator][0 if result == "WIN" else 1] += 1
+        if trade:
+            del _open[key]
+            _score.setdefault(indicator, [0, 0])
+            _score[indicator][0 if result == "WIN" else 1] += 1
 
-    db_exec("UPDATE relay_trades SET status = %s, closed_at = now() "
+    if trade is None:
+        return _record_orphan(d, symbol, indicator, result)
+
+    # Память уже закрыта, назад не откатываем: индикатор в TradingView свою
+    # сделку тоже закрыл и второй раз этот выход не пришлёт. Откат оставил бы
+    # пару занятой навсегда. Поэтому при сбое базы громко пишем в лог и в
+    # Telegram — расхождение надо чинить руками, а не молча терпеть.
+    if DATABASE_URL and db_exec(
+            "UPDATE relay_trades SET status = %s, closed_at = now() "
             "WHERE symbol = %s AND indicator = %s AND status = 'OPEN'",
-            (result, symbol, indicator))
+            (result, symbol, indicator)) is None:
+        logger.error("DATABASE WRITE FAILED — закрытие %s %s -> %s не записано в базу",
+                     symbol, indicator, result)
+        send_telegram(fmt_tech(
+            f"Результат <b>{indicator}</b> по <b>{symbol}</b> не записан в базу.\n"
+            f"В базе сделка осталась открытой, статистика разошлась."))
 
-    send_telegram(fmt_exit(trade, result))
+    if not send_telegram(fmt_exit(trade, result)):
+        logger.error("TELEGRAM DELIVERY FAILED — закрытие %s %s -> %s записано в базу, "
+                     "но сообщение не доставлено", symbol, indicator, result)
+
     logger.info("ЗАКРЫТА %s %s -> %s", symbol, indicator, result)
     return "closed"
+
+
+def _record_orphan(d: dict, symbol: str, indicator: str, result: str) -> str:
+    """Выход без подтверждённого входа.
+
+    Индикатор в TradingView считает сделку открытой, а релей о ней не знает:
+    вебхук со входом не дошёл (сервис спал, шёл деплой, сеть моргнула), а
+    TradingView доставку не повторяет. Раньше такой выход выбрасывался молча
+    и сделка исчезала бесследно — выборка тихо становилась неполной.
+
+    В WIN/LOSS такое событие не попадает: подтверждённого входа не было,
+    цен нет, считать его исходом нельзя. Оно лежит в отдельной таблице и
+    отвечает ровно на один вопрос — сколько сделок потерял транспорт.
+    """
+    logger.warning("ORPHAN_EXIT — выход %s от %s (%s) без подтверждённого входа",
+                   symbol, indicator, result)
+    if DATABASE_URL and db_exec(
+            "INSERT INTO relay_orphan_exits (symbol, indicator, tf, direction, result) "
+            "VALUES (%s,%s,%s,%s,%s)",
+            (symbol, indicator, d.get("tf"), d.get("dir"), result)) is None:
+        logger.error("DATABASE WRITE FAILED — ORPHAN_EXIT %s %s не записан в базу",
+                     symbol, indicator)
+    return "orphan exit"
 
 
 # ════════════════════════════════════════════════════════════════════════════
