@@ -67,6 +67,10 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SECRET = os.environ.get("WEBHOOK_SECRET", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+# Ключ для просмотра страницы состояния. Отдельный от WEBHOOK_SECRET:
+# тот защищает приём сигналов, этот — только чтение. Если не задан,
+# страница отдаёт лишь сводную строку — по умолчанию закрыто.
+VIEW_KEY = os.environ.get("VIEW_KEY", "")
 PORT = int(os.environ.get("PORT", 8080))
 
 ACCOUNT_SIZE = float(os.environ.get("ACCOUNT_SIZE", "1000"))
@@ -167,11 +171,12 @@ def db_init():
                        "при каждом перезапуске Render.")
         return
     db_exec(SCHEMA)
-    rows = db_exec("SELECT symbol, indicator, tf, direction, entry, stop, target "
+    rows = db_exec("SELECT symbol, indicator, tf, direction, entry, stop, target, opened_at "
                    "FROM relay_trades WHERE status = 'OPEN'", fetch=True) or []
     for r in rows:
         _open[(r[1], r[0])] = {"symbol": r[0], "indicator": r[1], "tf": r[2],
-                               "dir": r[3], "entry": r[4], "stop": r[5], "target": r[6]}
+                               "dir": r[3], "entry": r[4], "stop": r[5], "target": r[6],
+                               "opened_at": r[7]}
     # В счёт идут только состоявшиеся сделки: OPEN ещё не имеет исхода,
     # осиротевшие выходы лежат в другой таблице и сюда попасть не могут,
     # а служебные прогоны отсекаются по имени индикатора.
@@ -214,6 +219,17 @@ def _f(x):
         return "—"
     a = abs(v)
     return f"{v:,.8f}" if a < 0.001 else (f"{v:,.6f}" if a < 1 else f"{v:,.4f}")
+
+
+def _age(dt) -> str:
+    """Сколько сделка уже открыта. Только для отображения."""
+    if not dt:
+        return "—"
+    try:
+        h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+    except Exception:
+        return "—"
+    return f"{h:.0f} ч" if h < 48 else f"{h / 24:.0f} сут"
 
 
 def fmt_entry(t: dict) -> str:
@@ -294,6 +310,10 @@ def handle_entry(d: dict) -> str:
             return "duplicate active trade"
         trade = {k: d.get(k) for k in ("symbol", "indicator", "tf", "dir",
                                         "entry", "stop", "target", "mmo")}
+        # Время открытия — только для отображения. В базу оно пишется само,
+        # колонкой opened_at с DEFAULT now(); здесь дублируем в память, чтобы
+        # страница показывала возраст сделки без обращения к Neon.
+        trade["opened_at"] = datetime.now(timezone.utc)
         # Бронь под замком: она же защита от дубля. Если запись в базу не
         # пройдёт, бронь снимается ниже — иначе пара осталась бы навсегда
         # занятой сделкой, которой нигде нет.
@@ -418,10 +438,37 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        # Health-check для Render и пинга UptimeRobot; заодно видно состояние.
+        # Без ключа — только сводная строка. Этого достаточно и Render для
+        # health-check, и UptimeRobot: сервис отвечает 200 и просыпается.
+        # Полный список с уровнями отдаётся только по совпадающему ключу,
+        # потому что адрес публичный, а уровни сделок — нет.
+        #
+        # Обращения к базе здесь нет: UptimeRobot стучит каждые пять минут,
+        # будить ради этого Neon незачем, а _open и так её зеркало.
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        key_ok = bool(VIEW_KEY) and hmac.compare_digest(
+            str(q.get("k", [""])[0]), VIEW_KEY)
+
         with _lock:
-            state = ", ".join(f"{sym}:{ind}" for ind, sym in sorted(_open))
-        self._reply(200, f"alive | открыто {len(_open)}: {state or '—'}")
+            rows = sorted(_open.items())
+
+        if not key_ok:
+            self._reply(200, f"alive | открыто {len(rows)}")
+            return
+
+        lines = [f"alive | открыто {len(rows)}"]
+        last_ind = None
+        for (ind, sym), t in rows:
+            if ind != last_ind:
+                lines.append("")
+                lines.append(ind)
+                last_ind = ind
+            lines.append(f"  {sym:<10} {(t.get('dir') or ''):<5}"
+                         f"  вход {_f(t.get('entry'))}"
+                         f"  стоп {_f(t.get('stop'))}"
+                         f"  цель {_f(t.get('target'))}"
+                         f"  открыта {_age(t.get('opened_at'))}")
+        self._reply(200, "\n".join(lines))
 
     def do_HEAD(self):
         # UptimeRobot по умолчанию проверяет методом HEAD. Без этого метода
