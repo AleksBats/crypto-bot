@@ -102,6 +102,16 @@ CREATE TABLE IF NOT EXISTS relay_trades (
     opened_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     closed_at   TIMESTAMPTZ
 );
+-- MFE (maximum favourable excursion) в единицах R. Добавлено 12.09.2026.
+--
+-- Насколько далеко цена ушла в пользу сделки до того, как та закрылась.
+-- Для проигранной сделки это главное число: 0.9 значит «не дотянули чуть-чуть»,
+-- 0.1 значит «не пошло вообще». Без него выбор цели — угадывание, что уже
+-- стоило -21R при переходе на 3R.
+--
+-- ADD COLUMN IF NOT EXISTS безопасен: старые строки получат NULL, ни одна
+-- существующая запись не меняется, запросы без этой колонки не ломаются.
+ALTER TABLE relay_trades ADD COLUMN IF NOT EXISTS mfe_r DOUBLE PRECISION;
 -- Миграция ключа уникальности: раньше одна OPEN-сделка на символ,
 -- теперь одна OPEN-сделка на пару (индикатор, символ).
 -- DROP INDEX не трогает строки: индекс это служебная структура, а не данные.
@@ -219,6 +229,26 @@ def _f(x):
         return "—"
     a = abs(v)
     return f"{v:,.8f}" if a < 0.001 else (f"{v:,.6f}" if a < 1 else f"{v:,.4f}")
+
+
+def _mfe(x):
+    """MFE из вебхука -> float или None.
+
+    Pine присылает пустую строку для события entry и число для exit.
+    Любой мусор превращаем в None: отсутствующий замер лучше выдуманного,
+    а падать из-за поля статистики релей не должен — деньги важнее метрики.
+    """
+    if x is None or x == "":
+        return None
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    # Санитарный диапазон. MFE не может быть отрицательным по определению
+    # (это максимум в ПОЛЬЗУ сделки, а минимум ноль — цена входа), и не может
+    # быть 100R на нашем горизонте. Выброс за границы — признак поломки Pine,
+    # такое значение в статистику пускать нельзя.
+    return v if -0.01 <= v <= 100.0 else None
 
 
 def _age(dt) -> str:
@@ -383,10 +413,15 @@ def handle_exit(d: dict) -> str:
     # сделку тоже закрыл и второй раз этот выход не пришлёт. Откат оставил бы
     # пару занятой навсегда. Поэтому при сбое базы громко пишем в лог и в
     # Telegram — расхождение надо чинить руками, а не молча терпеть.
+    # MFE пишем тем же UPDATE, что и статус: отдельный запрос мог бы упасть
+    # и оставить сделку закрытой, но без замера. COALESCE не нужен — колонка
+    # заполняется ровно один раз, в момент закрытия.
+    mfe_r = _mfe(d.get("mfe"))
+
     if DATABASE_URL and db_exec(
-            "UPDATE relay_trades SET status = %s, closed_at = now() "
+            "UPDATE relay_trades SET status = %s, closed_at = now(), mfe_r = %s "
             "WHERE symbol = %s AND indicator = %s AND status = 'OPEN'",
-            (result, symbol, indicator)) is None:
+            (result, mfe_r, symbol, indicator)) is None:
         logger.error("DATABASE WRITE FAILED — закрытие %s %s -> %s не записано в базу",
                      symbol, indicator, result)
         send_telegram(fmt_tech(
@@ -397,7 +432,8 @@ def handle_exit(d: dict) -> str:
         logger.error("TELEGRAM DELIVERY FAILED — закрытие %s %s -> %s записано в базу, "
                      "но сообщение не доставлено", symbol, indicator, result)
 
-    logger.info("ЗАКРЫТА %s %s -> %s", symbol, indicator, result)
+    logger.info("ЗАКРЫТА %s %s -> %s  MFE=%s", symbol, indicator, result,
+                "—" if mfe_r is None else f"{mfe_r:.2f}R")
     return "closed"
 
 
